@@ -93,10 +93,7 @@ class Logger
      */
     static void init(const Options &options);
 
-    /**
-     * @brief 关闭日志系统
-     * @note 会等待后台线程处理完所有日志后退出
-     */
+    // 关闭日志系统，会等待后台线程处理完所有日志后退出
     static void shutdown();
 
     /**
@@ -121,37 +118,24 @@ class Logger
         minLevel_.store(level);
     }
 
-    /**
-     * @brief 获取当前日志级别
-     * @return 当前最小日志级别
-     */
+    // 获取当前日志级别
+
     static LogLevel getLevel()
     {
         return minLevel_.load();
     }
 
-    /**
-     * @brief 析构函数（公有，以支持 unique_ptr 管理）
-     */
+    // 析构
     ~Logger();
 
   private:
-    /**
-     * @brief 私有构造函数（单例模式）
-     * @param options 日志配置选项
-     */
+    // 私有构造函数（单例模式）
     Logger(const Options &options);
 
-    /**
-     * @brief 后台线程主函数
-     * @note 周期性调用 processEntries() 处理日志队列
-     */
+    // 后台线程主函数 周期性调用 processEntries() 处理日志队列
     void backgroundThread();
 
-    /**
-     * @brief 批量处理日志队列中的条目
-     * @note 每次最多处理 1000 条日志，避免单次处理时间过长
-     */
+    // 批量处理日志队列中的条目，每次最多处理 1000 条日志，避免单次处理时间过长
     void processEntries();
 
     /**

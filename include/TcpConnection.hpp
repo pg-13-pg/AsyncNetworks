@@ -15,8 +15,11 @@
 #include "MemoryPool.hpp"
 #include "Socket.hpp"
 
+/**
+ * TcpConnection 表示一条已经建立的 TCP 连接，是服务器中“单连接资源、状态和异步读写能力”的封装。
+ */
 // TCP连接状态枚举
-enum class TcpConnectionState
+enum class TcpConnectionState // class 枚举项被限制在 TcpConnectionState 作用域中 使用时 TcpConnectionState::kConnected
 {
     kDisconnected, // 断开连接
     kConnecting,   // 连接中
@@ -34,6 +37,8 @@ enum class BackpressureStrategy
     kPass             // 不处理：继续追加数据，可能导致内存无限增长（需业务层自行控制）
 };
 
+// std::enable_shared_from_this<TcpConnection>，允许类的成员函数在需要时，安全地获取一个指向当前对象（this）的
+// std::shared_ptr
 class TcpConnection : public std::enable_shared_from_this<TcpConnection>
 {
   public:
@@ -72,12 +77,15 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     }
     // 连接状态检查：在提交读写请求前检查连接状态，避免无效操作
     /**
-     * 为什么kDisConnecting状态也算是有效状态？因为在这个状态下，连接虽然正在断开，但还没有完全断开，底层Socket还没有被关闭，所以仍然可以提交写请求来发送剩余数据，或者提交读请求来读取对端发送的最后数据（如ACK）。如果在这个状态下拒绝提交请求，就无法实现优雅的连接关闭了。
+     * 为什么kDisConnecting状态也算是有效状态？因为在这个状态下，连接虽然正在断开，但还没有完全断开，底层Socket还没有被关闭，
+     * 所以仍然可以提交写请求来发送剩余数据，或者提交读请求来读取对端发送的最后数据（如ACK）。如果在这个状态下拒绝提交请求，
+     * 就无法实现优雅的连接关闭了。
      * 当然，如果业务场景不需要在断开过程中继续读写，也可以选择更严格地只允许kConnected状态，这取决于具体需求。
      * 这里的设计是为了提供更大的灵活性，让用户根据自己的业务需求来决定是否允许在断开过程中继续操作。
      * 但无论如何，在提交请求前都应该检查连接状态，避免在完全断开后提交无效请求导致错误。
      *
      */
+
     bool checkConnected() const
     {
         if (isConnected() || isDisconnecting())
@@ -138,8 +146,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     // 设置超时时间
     void setTimeout(std::chrono::milliseconds timeout);
 
-    // 异步读写操作的协程接口，创建 Awaitable
-    // 对象（这个Awaitable对象包含了读或写操作所需的所有参数），当使用co_await时会触发await_suspend提交io_uring请求
+    // 异步读写操作的协程接口，创建 Awaitable对象，这里的区别在于接受和发送的缓冲区不同
+    // （这个Awaitable对象包含了读或写操作所需的所有参数），当使用co_await时会触发await_suspend提交io_uring请求
     AsyncReadAwaitable asyncRead(size_t len)
     {
         return AsyncReadAwaitable(this, len);
@@ -182,7 +190,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
         return AsyncWriteAwaitable(this, in_fd, offset, count, true);
     }
 
-    // IORING_OP_SEND_ZC 零拷贝发送：直接从用户态缓冲区发送数据，绕过内核协议栈的内存拷贝
+    // IORING_OP_SEND_ZC 零拷贝发送：直接从用户态缓冲区发送数据，不经过socket，绕过内核协议栈的内存拷贝
     AsyncWriteAwaitable asyncSendZeroCopy(const char *data, size_t len)
     {
         checkOutputBufferBackpressure(len);
@@ -312,7 +320,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
 
     std::atomic<int> pendingSpecialWriteCount_{0}; // 有多少个特殊写请求(非 outputBuffer_ 的)正在被 io_uring 处理
 
-    std::atomic_bool closeCallbackInvoked_{false}; // 防止关闭回调被重复触发的保护位
+    std::atomic_bool closeCallbackInvoked_{false}; // 防止关闭回调被重复触发的保护位标志位，防止重复关闭
 
     bool reading_; // 是否处于读状态
 
@@ -322,13 +330,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     std::chrono::milliseconds readTimeout_; // 读超时时间
     __kernel_timespec readTimeoutSpec_;     // 读超时的内核时间结构体
 
-    // 存储当前读操作使用的输入缓冲区信息，可以为固定缓冲区也可以为用户提供的缓冲区
+    // 存储当前读操作使用的输入缓冲区信息，可以为使用的是EventLoop的注册缓冲区池也可以为用户提供的缓冲区
     void *curReadBuffer_;        // 当前读缓冲区指针
     size_t curReadBufferSize_;   // 当前读缓冲区的有效数据大小
-    size_t curReadBufferOffset_; // 当前读缓冲区的偏移位置
+    size_t curReadBufferOffset_; // 当前读缓冲区的偏移位置,已读数据的偏移量，
     Buffer outputBuffer_;        // 发送缓冲区
 
-    // 背压管理
+    // 背压管理，发送缓冲区
     BackpressureConfig backpressureConfig_;   // 背压配置
     OutputBufferStats outputBufferStats_;     // 统计信息
     std::atomic_bool inHighWaterMark_{false}; // 是否处于高水位

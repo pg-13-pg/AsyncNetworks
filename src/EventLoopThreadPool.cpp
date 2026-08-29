@@ -5,6 +5,7 @@
 
 #include "Logger.hpp"
 
+// 构造函数，初始化线程池，传入主线程的 EventLoop 对象
 EventLoopThreadPool::EventLoopThreadPool(EventLoop *baseLoop)
     : baseLoop_(baseLoop), started_(false), numThreads_(0), next_(0)
 {
@@ -29,12 +30,13 @@ void EventLoopThreadPool::start(const ThreadInitCallback &cb)
         threads_.push_back(std::move(t)); // 将线程对象添加到线程池中，使用 move 语义转移所有权
     }
 
-    if (numThreads_ == 0 && cb)
+    if (numThreads_ == 0 && cb) // 没有工作线程，直接在主线程的 EventLoop 上执行回调
     {
         cb(baseLoop_);
     }
 }
 
+// 轮询获取下一个 EventLoop 用于分配新连接，确保负载均衡
 EventLoop *EventLoopThreadPool::getNextLoop()
 {
     EventLoop *loop = baseLoop_;

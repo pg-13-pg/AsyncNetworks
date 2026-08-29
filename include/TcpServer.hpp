@@ -26,21 +26,21 @@
 class TcpServer
 {
   public:
-    using ConnectionCallback = std::function<void(const std::shared_ptr<TcpConnection> &)>;
+    using ConnectionCallback = std::function<void(const std::shared_ptr<TcpConnection> &)>; // 回调函数别名
 
     TcpServer(EventLoop *loop, const InetAddress &listenAddr, const std::string &name = "TcpServer");
     ~TcpServer();
-    // 禁用拷贝和赋值
+    // 禁用拷贝构造和赋值
     TcpServer(const TcpServer &) = delete;
     TcpServer &operator=(const TcpServer &) = delete;
 
-    void start();                      // 启动服务器，开始监听新连接
-    void setThreadNum(int numThreads); // 设置工作线程数量
-    void setEventLoopOptions(const EventLoop::Options &options)
+    void start();                                               // 启动服务器，开始监听新连接
+    void setThreadNum(int numThreads);                          // 设置工作线程数量
+    void setEventLoopOptions(const EventLoop::Options &options) // 设置EventLoop的配置选项
     {
         threadPool_.setEventLoopOptions(options);
     }
-    void setReadTimeout(std::chrono::milliseconds timeout)
+    void setReadTimeout(std::chrono::milliseconds timeout) // 设置读超时时间
     {
         readTimeout_ = timeout;
     }
@@ -58,7 +58,7 @@ class TcpServer
     const std::string name_;                // 服务器名称
     const std::string ipPort_;              // 服务器监听的地址和端口字符串表示
     std::unique_ptr<Acceptor> acceptor_;    // 负责监听和接受新连接的 Acceptor 对象
-    ConnectionCallback connectionCallback_; // 用户设置的新连接回调
+    ConnectionCallback connectionCallback_; // 用户设置的新连接业务回调
     std::atomic_bool started_;              // 服务器是否已启动
 
     int nextConnId_; // 下一个连接的 ID，用于生成唯一连接名称

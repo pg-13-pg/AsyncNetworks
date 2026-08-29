@@ -30,9 +30,9 @@ struct HttpRequest
     // 返回已消费的字节数，如果请求不完整返回 0
     size_t parse(const char *data, size_t len)
     {
-        std::string_view sv(data, len);
+        std::string_view sv(data, len); // 创建视图只读访问
 
-        // 查找请求头结束位置 "\r\n\r\n"
+        // 查找请求头结束位置 "\r\n\r\n"  最后一行\r\n + 空行\r\n
         size_t headerEnd = sv.find("\r\n\r\n");
         if (headerEnd == std::string_view::npos)
         {
@@ -118,7 +118,7 @@ struct HttpRequest
         // 提取请求体
         if (contentLength > 0)
         {
-            body = sv.substr(headerEnd + 4, contentLength);
+            body = sv.substr(headerEnd + 4, contentLength); // 空行\r\n 为4字节
         }
         else
         {
@@ -134,7 +134,7 @@ struct HttpRequest
 std::string buildHttpResponse(std::string_view body, bool keepAlive = true)
 {
     std::string response;
-    response.reserve(256 + body.size());
+    response.reserve(256 + body.size()); // 预留空间，不是反转reverse
 
     response += "HTTP/1.1 200 OK\r\n";
     response += "Content-Type: text/plain\r\n";
@@ -158,7 +158,7 @@ Task httpPingPongTask(std::shared_ptr<TcpConnection> conn)
 
         while (true)
         {
-            // 1. 异步读取数据
+            // 1. 异步读取数据，每次读取 4096 字节，不保证读完所有请求数据
             int n = co_await conn->asyncRead(4096);
 
             if (n <= 0)
@@ -211,7 +211,7 @@ Task httpPingPongTask(std::shared_ptr<TcpConnection> conn)
                 {
                     LOG_DEBUG("Client requested close: {}", conn->getName());
                     conn->forceClose();
-                    co_return;
+                    co_return; // 退出协程，结束处理
                 }
                 // 如果是 keep-alive，循环会继续，等待读取下一个请求
             }
@@ -237,7 +237,7 @@ int main(int argc, char **argv)
     Logger::Options logOptions;
     Logger::init(logOptions);
 
-    Config config;
+    Config config; // 读取配置文件，保存到config中
     std::string configError;
     if (!config.loadFromFile(configPath, &configError))
     {
@@ -274,7 +274,7 @@ int main(int argc, char **argv)
 
     // 0. 初始化内存池（必须在使用任何内存池分配前调用）
     LOG_DEBUG("Initializing memory pool...");
-    HashBucket::initMemoryPool();
+    HashBucket::initMemoryPool(); // 单例模式
     LOG_DEBUG("Memory pool initialized successfully.");
 
     // 1. 初始化 EventLoop

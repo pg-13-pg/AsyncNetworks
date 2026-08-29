@@ -55,7 +55,7 @@ class EventLoop
     // 让 EventLoop 停止运行
     void quit();
 
-    // 在当前 Loop 线程执行回调
+    // 在当前 Loop 线程执行回调，如果当前线程不是 Loop 所在线程，则将回调放入任务队列，并唤醒 Loop 所在线程执行
     void runInLoop(Functor cb);
     // 把回调放入任务队列，并唤醒对应的 enentLoop 线程执行
     void queueInLoop(Functor cb);
@@ -106,27 +106,27 @@ class EventLoop
     // 提交异步读操作以监听 wakeupFd_
     void asyncReadWakeup();
 
-    Options options_;
+    Options options_;          // 配置
     std::atomic_bool running_; // 事件循环是否在运行
     std::atomic_bool quit_;    // 是否请求退出事件循环
     const pid_t threadId_;     // 事件循环所属线程的ID ，使用pid_t更加贴近内核，便于调试
 
-    int wakeupFd_;            // 用于唤醒子线程事件循环实现线程通信的文件描述符，即eventfd
+    int wakeupFd_;            // 用于唤醒当前 EventLoop 所在线程，实现跨线程任务通知，即eventfd
     uint64_t wakeupBuffer_;   // eventfd 读取数据的缓冲区
     IoContext wakeupContext_; // 提供给io_uring的唤醒事件的上下文
 
     //   std::mutex mutex_;
     //   std::vector<Functor> pendingFunctors_;
-    LockFreeQueue<Functor> pendingFunctors_;
-    bool callingPendingFunctors_; // 是否正在执行任务队列
+    LockFreeQueue<Functor> pendingFunctors_; // 任务队列，回调任务
+    bool callingPendingFunctors_;            // 是否正在执行任务队列
 
     // 背压管理
     BackpressureCallback backpressureCallback_; // 水位变化回调
     BackpressureStats backpressureStats_;       // 统计信息
     std::atomic_bool inHighWaterMark_{false};   // 是否已处于高水位状态
 
-    std::vector<void *> registeredBuffersPool;  // 缓冲区池，给TcpConnection复用
-    std::vector<struct iovec> registeredIovecs; // 注册到io_uring的iovec数组
+    std::vector<void *> registeredBuffersPool;  // 缓冲区池，给TcpConnection复用，接发数据的缓冲区
+    std::vector<struct iovec> registeredIovecs; // iovec 数组描述的是同一批缓冲区的地址和长度，并用于注册到 io_uring
 
     // 极致性能优化：单线程模型下无需锁或原子操作，直接用 vector 当栈
     std::vector<int> freeBufferIndices_; // 可用缓冲区索引栈

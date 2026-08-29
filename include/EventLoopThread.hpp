@@ -19,7 +19,8 @@ class EventLoopThread
   public:
     using ThreadInitCallback = std::function<void(EventLoop *)>;
 
-    EventLoopThread(const EventLoop::Options &options, const ThreadInitCallback &cb = ThreadInitCallback());
+    EventLoopThread(const EventLoop::Options &options,
+                    const ThreadInitCallback &cb = ThreadInitCallback()); // 默认为空回调
     ~EventLoopThread();
 
     // 禁止拷贝和赋值

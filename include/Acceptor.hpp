@@ -56,7 +56,7 @@ class Acceptor
     NewConnectionCallback newConnectionCallback_; // 新连接到来的回调函数
 
     // 用于 io_uring accept 的缓冲区
-    struct sockaddr_in clientAddr_;
-    socklen_t clientAddrLen_;
-    IoContext acceptContext_; // 专门用于 accept 的上下文
+    struct sockaddr_in clientAddr_; // 客户端地址结构体
+    socklen_t clientAddrLen_;       // 客户端地址长度
+    IoContext acceptContext_;       // 专门用于 accept 的上下文
 };

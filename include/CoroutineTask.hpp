@@ -1,9 +1,9 @@
 #pragma once
 
+#include "MemoryPool.hpp"
 #include <coroutine>
 #include <exception>
 #include <utility>
-#include "MemoryPool.hpp"
 
 /**
  * @brief 简单的协程任务类 (Coroutine Return Object)
@@ -13,17 +13,32 @@ struct Task
 {
     struct promise_type
     {
-        Task get_return_object() { return Task{std::coroutine_handle<promise_type>::from_promise(*this)}; }
-        std::suspend_never initial_suspend() { return {}; }        // 协程创建后立即执行
-        std::suspend_never final_suspend() noexcept { return {}; } // 协程结束后不挂起，立即销毁自身
-        void return_void() {}                                      // 表示协程无返回值
-        void unhandled_exception() { std::terminate(); }           // 协程出错时终止程序
-
+        Task get_return_object()
+        {
+            return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend()
+        {
+            return {};
+        } // 协程创建后立即执行， std::suspend_always 表示协程创建后立即挂起，
+        std::suspend_never final_suspend() noexcept
+        {
+            return {};
+        } // 协程结束后不挂起，立即销毁自身
+        void return_void()
+        {
+        } // 表示协程无返回值
+        void unhandled_exception()
+        {
+            std::terminate();
+        } // 协程出错时终止程序
     };
 
     std::coroutine_handle<promise_type> handle_;
 
-    Task(std::coroutine_handle<promise_type> h) : handle_(h) {}
+    Task(std::coroutine_handle<promise_type> h) : handle_(h)
+    {
+    }
     ~Task()
     {
         // 由于 final_suspend 返回 suspend_never，协程会自动销毁，

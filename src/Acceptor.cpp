@@ -18,7 +18,7 @@ static int createNonblockingSocket()
     {
         // TODO: 这里可以考虑抛出异常或者返回错误码，当前简单处理为日志记录和终止程序
         LOG_ERROR("Acceptor socket create failed: {}", std::strerror(errno));
-        abort();
+        abort(); // 终止程序
     }
     return listenSocketFd;
 }
@@ -29,7 +29,7 @@ Acceptor::Acceptor(EventLoop *loop, const InetAddress &listenAddr, bool reusepor
 {
     // 允许地址重用，防止TIME_WAIT导致绑定失败
     listenSocket_.setReuseAddr(true);
-    // 端口重用，为以后扩展多线程acceptor做准备
+    // 端口重用，为以后扩展多线程acceptor做准备，内核把新连接分配给其中一个监听 socket
     listenSocket_.setReusePort(reuseport);
     // 绑定监听地址
     listenSocket_.bindAddress(listenAddr);
@@ -46,13 +46,15 @@ Acceptor::~Acceptor()
     }
 }
 
+// TCPServer::start()中由loop_->runInLoop()调用，提交第一个异步accept请求
 void Acceptor::listen()
 {
     listening_ = true;
-    listenSocket_.listen();
-    asyncAccept(); // 提交第一个 accept 请求
+    listenSocket_.listen(); // socket.listen() 监听本地端口，准备接受连接
+    asyncAccept();          // 提交第一个 accept 请求
 }
 
+// 处理监听Socket可读事件的回调函数，接受新连接
 void Acceptor::asyncAccept()
 {
     // 获取 SQE
@@ -75,13 +77,16 @@ void Acceptor::asyncAccept()
     // io_uring_submit(&(acceptLoop_->ring_));
 }
 
+/*提交了一次io_uring_accept后,CQE只返回了一次accept，
+ *但是可能同时有多个新连接到来,所以需要在handleRead中循环调用accept4直到返回EAGAIN
+ */
 void Acceptor::handleRead(int res)
 {
     // res 是 io_uring 异步 accept 的返回值，即第一个新的 connfd
     if (res >= 0)
     {
         int connfd = res;
-        InetAddress peerAddr(clientAddr_);
+        InetAddress peerAddr(clientAddr_); // 保存客户端地址
         if (newConnectionCallback_)
         {
             newConnectionCallback_(connfd, peerAddr); // 执行新连接处理回调函数
@@ -130,7 +135,7 @@ void Acceptor::handleRead(int res)
     else
     {
         // io_uring accept 失败
-        // 如果是 ECANCELED，说明可能是 EventLoop 正在退出
+        // 如果是 ECANCELED（accept请求被取消），说明可能是 EventLoop 正在退出
         if (res != -ECANCELED)
         {
             errno = -res;
@@ -138,7 +143,7 @@ void Acceptor::handleRead(int res)
         }
     }
 
-    // 队列已经空了（或者发生非致命错误），只要还在监听且未被取消，就再次向 io_uring 提交下一次等待
+    // backlog队列已经空了（或者发生非致命错误），只要还在监听且未被取消，就再次向 io_uring 提交下一次等待
     if (listening_ && res != -ECANCELED)
     {
         clientAddrLen_ = sizeof(clientAddr_);

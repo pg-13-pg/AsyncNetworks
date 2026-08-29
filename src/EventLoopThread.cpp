@@ -23,18 +23,19 @@ EventLoopThread::~EventLoopThread()
 // 真正创建线程的函数
 EventLoop *EventLoopThread::startLoop()
 {
-    thread_ = std::thread(std::bind(&EventLoopThread::threadFunc, this));
+    thread_ = std::thread(std::bind(&EventLoopThread::threadFunc, this)); // 创建工作线程
 
     EventLoop *loop = nullptr;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        cond_.wait(lock, [this] { return loop_ != nullptr; }); // 等待直到 loop_ 被设置
+        cond_.wait(lock, [this] { return loop_ != nullptr; }); // 主线程执行 ,等待工作线程创建loop直到 loop_ 被设置
         loop = loop_;
-        loop->initRegisteredBuffers();
+        loop->initRegisteredBuffers(); // 初始化注册缓冲区，必须在 loop_ 创建后立即调用，确保缓冲区池可用
     }
     return loop;
 }
 
+// 工作线程的主函数，创建 EventLoop 对象并启动事件循环
 void EventLoopThread::threadFunc()
 {
     EventLoop loop(options_); // 栈上创建EventLoop对象
@@ -43,7 +44,7 @@ void EventLoopThread::threadFunc()
 
     if (callback_)
     {
-        callback_(&loop);
+        callback_(&loop); // 执行回调
     }
 
     {

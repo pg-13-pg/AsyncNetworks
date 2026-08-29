@@ -23,7 +23,7 @@ void TcpConnection::setState(TcpConnectionState state)
 {
     state_.store(state);
 }
-
+// 重置TcpConnection（未使用）
 void TcpConnection::reset()
 {
     socket_.reset();
@@ -61,6 +61,7 @@ void TcpConnection::shutdown()
     }
 }
 
+// 实现 TCP 的优雅半关闭
 void TcpConnection::maybeShutdownWrite()
 {
     // 这个方法通常由底层写回调(如 AsyncWrite 恢复时)调用
@@ -71,10 +72,11 @@ void TcpConnection::maybeShutdownWrite()
     }
 }
 
+// 以线程安全的方式把连接从 kConnected 切换到 kDisconnecting，然后把真正的关闭处理投递到连接所属的 EventLoop 线程。
 void TcpConnection::forceClose()
 {
     TcpConnectionState expected = TcpConnectionState::kConnected;
-    if (state_.compare_exchange_strong(expected, TcpConnectionState::kDisconnecting))
+    if (state_.compare_exchange_strong(expected, TcpConnectionState::kDisconnecting)) // 原子操作，确保线程安全
     {
         LOG_INFO("TcpConnection::forceClose CAS success, queueing handleClose, conn={}", name_);
         loop_->queueInLoop(std::bind(&TcpConnection::handleClose, shared_from_this()));
@@ -85,6 +87,7 @@ void TcpConnection::forceClose()
     }
 }
 
+// 准备读SQE，可选准备超时SQE（在EventLoop中提交），使用EventLoop的注册缓冲区
 void TcpConnection::submitReadRequest(size_t nbytes)
 {
     if (!isConnected())
@@ -115,10 +118,10 @@ void TcpConnection::submitReadRequest(size_t nbytes)
         // 输出错误信息
         LOG_ERROR("TcpConnection::submitReadRequest: no registered buffer available");
     }
-
+    // 设置读超时sqe关联读sqe
     if (readTimeout_ > std::chrono::milliseconds::zero())
     {
-        io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+        io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK); // 表示当前 SQE 与紧随其后的下一个 SQE 属于同一条操作链。
         io_uring_sqe *ts_sqe = io_uring_get_sqe(&loop_->ring_);
         if (ts_sqe)
         {
@@ -132,6 +135,7 @@ void TcpConnection::submitReadRequest(size_t nbytes)
     }
 }
 
+// 使用调用者提供的普通内存缓冲区提交异步 socket read
 void TcpConnection::submitReadRequestWithUserBuffer(char *userBuf, size_t userBufCap, size_t nbytes)
 {
     if (!isConnected())
@@ -175,6 +179,7 @@ void TcpConnection::submitReadRequestWithUserBuffer(char *userBuf, size_t userBu
     }
 }
 
+// 准备write SQE，使用TCPConnection的发送缓冲区outputBuffer_
 void TcpConnection::submitWriteRequest()
 {
     if (!isConnected() && !isDisconnecting())
@@ -192,14 +197,14 @@ void TcpConnection::submitWriteRequest()
     }
 
     // 准备写操作
-    // 注意：write 操作不应该修改 outputBuffer_
-    // 的可读位置，直到写操作完成(handleWrite)
+    // 注意：write 操作不应该修改 outputBuffer_的可读位置，直到写操作完成(handleWrite)
     io_uring_prep_write(sqe, socket_.getFd(), outputBuffer_.readBeginAddr(), outputBuffer_.readableBytes(), 0);
     io_uring_sqe_set_data(sqe, &writeContext_);
     // 标记未使用已注册缓冲区
     writeContext_.idx = -1;
 }
 
+// 准备write SQE 使用注册到当前 EventLoop io_uring 的固定缓冲区
 void TcpConnection::submitWriteRequestWithRegBuffer(void *buf, size_t len, int idx)
 {
     if (!isConnected() && !isDisconnecting())
@@ -221,6 +226,7 @@ void TcpConnection::submitWriteRequestWithRegBuffer(void *buf, size_t len, int i
     writeContext_.idx = idx;
 }
 
+// 发送大文件sendfile请求，使用io_uring的splice实现零拷贝，(todo)
 void TcpConnection::submitSendfileRequest(int in_fd, off_t offset, size_t count)
 {
     if (!isConnected() && !isDisconnecting())
@@ -235,7 +241,6 @@ void TcpConnection::submitSendfileRequest(int in_fd, off_t offset, size_t count)
         LOG_ERROR("TcpConnection::submitSendfileRequest: SQ full");
         return;
     }
-
     // 虽然 io_uring 尚未原生提供 io_uring_prep_sendfile，
     // 在内核层面 sendfile 通常是通过 splice 来实现的。
     // 为了支持发送文件直接到 socket，我们这里通过预备 splice 操作来实现：
@@ -246,6 +251,7 @@ void TcpConnection::submitSendfileRequest(int in_fd, off_t offset, size_t count)
     writeContext_.idx = -1; // 标记未使用已注册缓冲区
 }
 
+// 零拷贝发送，未实现
 void TcpConnection::submitWriteRequestWithZeroCopy(const char *data, size_t len, bool isZc)
 {
     if (!isConnected() && !isDisconnecting())
@@ -255,6 +261,7 @@ void TcpConnection::submitWriteRequestWithZeroCopy(const char *data, size_t len,
     }
 }
 
+// 设置超时时间
 void TcpConnection::setTimeout(std::chrono::milliseconds timeout)
 {
     readTimeout_ = timeout;
@@ -262,6 +269,8 @@ void TcpConnection::setTimeout(std::chrono::milliseconds timeout)
     readTimeoutSpec_.tv_nsec = (timeout.count() % 1000) * 1000000;
 }
 
+// 关闭事件处理入口，创建一个临时的 shared_ptr 保护当前连接，然后立即调用已经提前注册好的
+// closeCallback_(guard)(TcpServer::removeConnection(guard) -> TcpConnection::connectDestroyed());
 void TcpConnection::handleClose()
 {
     LOG_INFO("TcpConnection::handleClose called, conn={}, state={}", name_, static_cast<int>(state_.load()));
@@ -277,7 +286,7 @@ void TcpConnection::handleClose()
         LOG_INFO("TcpConnection::handleClose closeCallback already invoked, conn={}", name_);
         return;
     }
-    // 保护 TcpConnection，防止在回调过程中被销毁
+    // 保护 TcpConnection，防止在回调过程中被销毁，（两次shared_ptr）
     std::shared_ptr<TcpConnection> guard(shared_from_this());
     if (closeCallback_)
     {
@@ -290,6 +299,8 @@ void TcpConnection::handleClose()
     }
 }
 
+// 结束当前读取数据的使用。如果本次读取使用的是 EventLoop 注册缓冲区，
+// 就把缓冲区索引归还缓冲池；最后清空 TcpConnection保存的读取数据视图。
 void TcpConnection::releaseCurReadBuffer()
 {
     if (readContext_.idx >= 0)
@@ -302,6 +313,8 @@ void TcpConnection::releaseCurReadBuffer()
     curReadBufferOffset_ = 0;
 }
 
+// 新 socket 已经由 accept 创建，并且 TcpConnection 已经被分配到目标
+// EventLoop；现在完成框架层连接初始化，并启动业务处理。
 void TcpConnection::connectEstablished()
 {
     // 将状态设置为已连接
@@ -311,20 +324,26 @@ void TcpConnection::connectEstablished()
     readContext_.connection = shared_from_this();
     writeContext_.connection = shared_from_this();
     timeoutContext_.connection = shared_from_this();
-    // 修复循环引用：使用 weak_ptr 而不是直接捕获 shared_ptr
+    // 设置超时回调，修复循环引用：使用 weak_ptr 而不是直接捕获 shared_ptr
+    /**
+     * TcpConnection
+     *→ handler
+     *→ weak_ptr
+     *-X-> 不拥有TcpConnection
+     */
     timeoutContext_.handler = [weak_self = std::weak_ptr<TcpConnection>(shared_from_this())](int res) {
         LOG_INFO("Timeout handler called, res={}", res);
         if (res == -ECANCELED) // 返回-ECANCELED表示没有超时，直接返回
             return;
 
-        // 尝试提升 weak_ptr
+        // 尝试提升 weak_ptr->shared_ptr，检查 TcpConnection 是否仍然存在
         auto self = weak_self.lock();
         if (!self)
         {
             LOG_INFO("Timeout handler: connection already destroyed");
             return;
         }
-        if (!self->isConnected())
+        if (!self->isConnected()) // 对象存在且未被销毁，但连接状态不是已连接，说明连接已经断开
         {
             LOG_INFO("Timeout handler: connection not connected");
             return;
@@ -334,13 +353,14 @@ void TcpConnection::connectEstablished()
         self->forceClose(); // 说明发生超时，强制关闭连接
     };
 
-    // 这里调用 connectionCallback_
+    // 这里调用 connectionCallback_，业务连接回调，启动业务处理
     if (connectionCallback_)
     {
-        connectionCallback_(shared_from_this());
+        connectionCallback_(shared_from_this()); // 异步调用（协程）
     }
 }
 
+// 真正的连接销毁处理函数，确保底层 Socket 被关闭，避免 fd 泄漏，TCPConnection对象还没有被销毁，
 void TcpConnection::connectDestroyed()
 {
     LOG_INFO("TcpConnection::connectDestroyed called, conn={}, state={}, fd={}", name_, static_cast<int>(state_.load()),
@@ -352,8 +372,8 @@ void TcpConnection::connectDestroyed()
     closeCallbackInvoked_.store(true);
 
     // 关键修复：主动关闭底层 Socket 文件描述符
-    // 否则如果还有其他地方（比如 io_uring 的 IoContext）持有 shared_ptr，
-    // Socket 的析构函数就不会被调用，fd 就不会被关闭，连接也就一直挂着。
+    // 否则如果还有其他地方，
+    // Socket类 的析构函数就不会被调用，fd 就不会被关闭，连接也就一直挂着。
     socket_.closeFd();
     LOG_INFO("TcpConnection::connectDestroyed fd closed, conn={}", name_);
 
@@ -366,6 +386,7 @@ void TcpConnection::connectDestroyed()
 // 提供实现以避免链接错误。
 // void TcpConnection::handleRead(int) {}
 // void TcpConnection::handleWrite(int) {}
+
 // 检查发送缓冲区是否触发背压（在每次 asyncSend 追加数据前调用）
 // 目的：防止慢接收客户端导致服务端发送缓冲区无限膨胀，最终 OOM
 void TcpConnection::checkOutputBufferBackpressure(size_t incomingBytes)
@@ -379,8 +400,8 @@ void TcpConnection::checkOutputBufferBackpressure(size_t incomingBytes)
     // 检查是否超过高水位阈值
     if (newSize >= backpressureConfig_.outputBufferHighWaterMark)
     {
-        // 使用原子操作确保只在第一次跨越水位时打印日志和计数
-        bool wasInHighWaterMark = inHighWaterMark_.exchange(true);
+        // 使用原子操作确保只在第一次跨越水位时打印日志和计数 , 低->高
+        bool wasInHighWaterMark = inHighWaterMark_.exchange(true); // 原子操作，复制inHighWaterMark_的旧值并设置为true，
         if (!wasInHighWaterMark)
         {
             outputBufferStats_.highWaterMarkCount++;

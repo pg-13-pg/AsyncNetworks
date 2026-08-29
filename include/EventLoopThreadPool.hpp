@@ -7,6 +7,10 @@
 
 #include "EventLoop.hpp"
 
+/**
+ * 创建并管理多个 EventLoopThread，收集每个工作线程中的 EventLoop 地址，
+ * 并通过轮询方式把新连接分配给不同的工作 EventLoop。
+ */
 class EventLoop;
 class EventLoopThread;
 

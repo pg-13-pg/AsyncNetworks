@@ -10,7 +10,7 @@ void AsyncReadAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept
 {
     // 将协程句柄保存到IoContext中，以便在读操作完成时恢复协程
     conn_->getReadContext().coro_handle = handle;
-    // 提交io_uring读请求
+    // 重新提交提交io_uring读请求，否则协程会被挂起但不会触发读操作，导致无法继续执行
     if (userBuf_ == nullptr)
     {
         conn_->submitReadRequest(nbytes_);
