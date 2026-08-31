@@ -1,8 +1,8 @@
 #pragma once
 
 #include <coroutine>
+#include <cstdio>
 #include <exception>
-#include <iostream>
 #include <optional>
 #include <utility>
 
@@ -298,9 +298,9 @@ public:
             try {
                 throw;
             } catch (const std::exception& exception) {
-                std::cerr << "DetachedTask exception: " << exception.what() << '\n';
+                std::fprintf(stderr, "DetachedTask exception: %s\n", exception.what());
             } catch (...) {
-                std::cerr << "DetachedTask exception: unknown exception\n";
+                std::fputs("DetachedTask exception: unknown exception\n", stderr);
             }
         }
     };
