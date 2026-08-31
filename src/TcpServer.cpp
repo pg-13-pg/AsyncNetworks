@@ -32,7 +32,11 @@ void TcpServer::start()
     // 初始化线程池
     threadPool_.start();
     // 开始监听
-    loop_->runInLoop([this]() { acceptor_->listen(); });
+    auto listen = [this]() { acceptor_->listen(); };
+    if (!loop_->runInLoop(listen))
+    {
+        loop_->queueControlInLoop(std::move(listen));
+    }
     started_.store(true);
 }
 
@@ -64,17 +68,26 @@ void TcpServer::newConnection(int sockfd, const InetAddress &peerAddr)
     connections_[connName] = conn;
 
     // 在对应的 EventLoop 线程中建立连接
-    ioLoop->runInLoop(std::bind(&TcpConnection::connectEstablished, conn));
+    auto establish = std::bind(&TcpConnection::connectEstablished, conn);
+    if (!ioLoop->runInLoop(establish))
+    {
+        ioLoop->queueControlInLoop(std::move(establish));
+    }
 }
 
 void TcpServer::removeConnection(const std::shared_ptr<TcpConnection> &conn)
 {
     // 在主线程的 EventLoop 中移除连接
-    loop_->runInLoop([this, conn]() {
+    auto remove = [this, conn]() {
         // 从活动连接列表中移除连接
         connections_.erase(conn->getName());
         // 在连接所属的 EventLoop 线程中销毁连接
         EventLoop *ioLoop = conn->getLoop();
-        ioLoop->queueInLoop(std::bind(&TcpConnection::connectDestroyed, conn));
-    });
+        ioLoop->queueControlInLoop(
+            std::bind(&TcpConnection::connectDestroyed, conn));
+    };
+    if (!loop_->runInLoop(remove))
+    {
+        loop_->queueControlInLoop(std::move(remove));
+    }
 }

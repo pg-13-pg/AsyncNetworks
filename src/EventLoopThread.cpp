@@ -13,10 +13,16 @@ EventLoopThread::EventLoopThread(const EventLoop::Options &options, const Thread
 EventLoopThread::~EventLoopThread()
 {
     exiting_ = true;
-    if (loop_ != nullptr)
     {
-        loop_->quit();
-        thread_.join(); // 等待线程退出，确保资源安全释放
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (loop_ != nullptr)
+        {
+            loop_->quit();
+        }
+    }
+    if (thread_.joinable())
+    {
+        thread_.join();
     }
 }
 
@@ -30,7 +36,6 @@ EventLoop *EventLoopThread::startLoop()
         std::unique_lock<std::mutex> lock(mutex_);
         cond_.wait(lock, [this] { return loop_ != nullptr; }); // 主线程执行 ,等待工作线程创建loop直到 loop_ 被设置
         loop = loop_;
-        loop->initRegisteredBuffers(); // 初始化注册缓冲区，必须在 loop_ 创建后立即调用，确保缓冲区池可用
     }
     return loop;
 }
@@ -41,6 +46,11 @@ void EventLoopThread::threadFunc()
     EventLoop loop(options_); // 栈上创建EventLoop对象
 
     LOG_INFO("EventLoop thread start, loop={}", static_cast<void *>(&loop));
+
+    if (!loop.initRegisteredBuffers())
+    {
+        LOG_WARN("EventLoop registered-buffer initialization failed; using ordinary buffers");
+    }
 
     if (callback_)
     {

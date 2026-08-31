@@ -4,14 +4,18 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
-#include <queue>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "Buffer.hpp"
 #include "IoContext.hpp"
 #include "LockFreeQueue.hpp"
+#include "ucp/runtime/IoOperation.hpp"
 
 /**
  * 事件循环类，负责管理和分发事件。
@@ -29,6 +33,7 @@ class EventLoop
         size_t registeredBuffersCount = 16384;
         size_t registeredBuffersSize = 4096;
         size_t pendingQueueCapacity = 65536;
+        size_t pendingSubmissionCapacity = 4096;
         // 背压管理配置：用于控制跨线程任务队列(pendingFunctors_)的积压情况
         // 当队列长度达到高水位时，触发告警或回调，防止内存无限增长
         size_t pendingQueueHighWaterMark = 58982; // 默认高水位：容量的 90%
@@ -38,6 +43,21 @@ class EventLoop
     };
 
     using Functor = std::function<void()>;
+    using OperationPreparer =
+        std::function<void(std::span<io_uring_sqe *>, ucp::IoOperation &)>;
+
+    enum class SubmitDisposition
+    {
+        submitted,
+        queued,
+        rejected
+    };
+
+    struct SubmitResult
+    {
+        SubmitDisposition disposition;
+        ucp::Error error;
+    };
     // 背压回调：当队列从正常→高水位(true) 或 高水位→正常(false) 时调用
     // 业务层可利用此回调实现全局限流（如暂停接收新连接）
     using BackpressureCallback = std::function<void(bool highWaterMarkReached)>;
@@ -56,9 +76,18 @@ class EventLoop
     void quit();
 
     // 在当前 Loop 线程执行回调，如果当前线程不是 Loop 所在线程，则将回调放入任务队列，并唤醒 Loop 所在线程执行
-    void runInLoop(Functor cb);
+    bool runInLoop(Functor cb);
     // 把回调放入任务队列，并唤醒对应的 enentLoop 线程执行
-    void queueInLoop(Functor cb);
+    bool queueInLoop(Functor cb);
+    void queueControlInLoop(Functor cb);
+    bool isInLoopThread() const noexcept;
+
+    std::uint64_t nextOperationId() noexcept;
+    SubmitResult submitOperation(std::shared_ptr<ucp::IoOperation> operation,
+                                 std::size_t sqeCount,
+                                 OperationPreparer prepare);
+    bool cancelOperation(const std::shared_ptr<ucp::IoOperation> &operation);
+    std::size_t inFlightOperationCount() const noexcept;
 
     // 协程恢复逻辑，当 io_uring_wait_cqe 返回时调用
     void handleCompletionEvent(struct io_uring_cqe *cqe);
@@ -67,7 +96,7 @@ class EventLoop
     void wakeup();
 
     // 初始化缓冲区池
-    void initRegisteredBuffers();
+    bool initRegisteredBuffers();
 
     // 从可用缓冲区中获取一个缓冲区，返回缓冲区索引
     int getRegisteredBufferIndex();
@@ -103,8 +132,25 @@ class EventLoop
     void handleWakeup();
     // 执行任务队列中的任务，通常是建立新连接
     void doPendingFunctors();
+    void doControlFunctors();
+    void flushPendingSubmissions();
+    bool prepareSubmission(const std::shared_ptr<ucp::IoOperation> &operation,
+                           std::size_t sqeCount,
+                           const OperationPreparer &prepare);
+    void finishRejectedOperation(
+        const std::shared_ptr<ucp::IoOperation> &operation,
+        ucp::Error error);
+    bool submitCancel(const std::shared_ptr<ucp::IoOperation> &operation);
+    void retryCancel(const std::shared_ptr<ucp::IoOperation> &operation);
     // 提交异步读操作以监听 wakeupFd_
     void asyncReadWakeup();
+
+    struct PendingSubmission
+    {
+        std::shared_ptr<ucp::IoOperation> operation;
+        std::size_t sqeCount;
+        OperationPreparer prepare;
+    };
 
     Options options_;          // 配置
     std::atomic_bool running_; // 事件循环是否在运行
@@ -118,15 +164,27 @@ class EventLoop
     //   std::mutex mutex_;
     //   std::vector<Functor> pendingFunctors_;
     LockFreeQueue<Functor> pendingFunctors_; // 任务队列，回调任务
+    std::atomic_size_t pendingFunctorCount_{0};
     bool callingPendingFunctors_;            // 是否正在执行任务队列
+    std::mutex controlMutex_;
+    std::deque<Functor> controlFunctors_;
+    std::deque<PendingSubmission> pendingSubmissions_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<ucp::IoOperation>> inFlightOperations_;
+    std::atomic_size_t inFlightOperationCount_{0};
+    std::uint64_t nextOperationId_{1};
 
     // 背压管理
     BackpressureCallback backpressureCallback_; // 水位变化回调
-    BackpressureStats backpressureStats_;       // 统计信息
+    std::atomic_size_t maxPendingQueueSize_{0};
+    std::atomic_uint64_t queueFullCount_{0};
+    std::atomic_uint64_t highWaterMarkEvents_{0};
+    std::atomic_uint64_t lowWaterMarkEvents_{0};
     std::atomic_bool inHighWaterMark_{false};   // 是否已处于高水位状态
 
     std::vector<void *> registeredBuffersPool;  // 缓冲区池，给TcpConnection复用，接发数据的缓冲区
     std::vector<struct iovec> registeredIovecs; // iovec 数组描述的是同一批缓冲区的地址和长度，并用于注册到 io_uring
+    bool registeredBuffersInitialized_{false};
+    bool registeredBuffersActive_{false};
 
     // 极致性能优化：单线程模型下无需锁或原子操作，直接用 vector 当栈
     std::vector<int> freeBufferIndices_; // 可用缓冲区索引栈
