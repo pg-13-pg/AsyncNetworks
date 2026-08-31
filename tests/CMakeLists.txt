@@ -7,3 +7,4 @@ endfunction()
 
 add_ucp_test(ucp_result_test result_test.cpp)
 add_ucp_test(ucp_task_test task_test.cpp)
+add_ucp_test(ucp_io_operation_test io_operation_test.cpp)
