@@ -111,7 +111,9 @@ CompletionDecision IoOperation::onCompletion(
                 resume = selectResult(IoResult::success(
                     static_cast<std::size_t>(kernelResult)));
             }
-        } else if (cancelRequested_ && kernelResult < 0) {
+        } else if (cancelRequested_
+                   && kind == CompletionKind::io
+                   && kernelResult == -ECANCELED) {
             resume = selectResult(IoResult::failure(
                 {ErrorCode::cancelled, ECANCELED, "operation cancelled"}));
         } else if (kind == CompletionKind::timeout) {

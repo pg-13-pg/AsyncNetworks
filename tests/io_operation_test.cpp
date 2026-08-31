@@ -26,5 +26,16 @@ int main()
     CHECK(cancel.requestCancel());
     CHECK(cancel.onCompletion(ucp::CompletionKind::io, -ECANCELED).resume);
     CHECK_EQ(cancel.result().error().code, ucp::ErrorCode::cancelled);
+
+    ucp::IoOperation cancelRace(4, ucp::OperationType::write, true);
+    cancelRace.arm(2);
+    CHECK(cancelRace.requestCancel());
+    CHECK(!cancelRace.onCompletion(
+        ucp::CompletionKind::timeout, -ECANCELED).resume);
+    auto completedWrite = cancelRace.onCompletion(
+        ucp::CompletionKind::io, 12);
+    CHECK(completedWrite.resume);
+    CHECK(completedWrite.drained);
+    CHECK_EQ(cancelRace.result().value(), 12U);
     return 0;
 }
