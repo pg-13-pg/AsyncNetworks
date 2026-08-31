@@ -6,3 +6,4 @@ function(add_ucp_test target source)
 endfunction()
 
 add_ucp_test(ucp_result_test result_test.cpp)
+add_ucp_test(ucp_task_test task_test.cpp)
