@@ -2,7 +2,9 @@
 
 #include <unistd.h>
 
+#include <cassert>
 #include <cstring>
+#include <vector>
 
 TcpConnection::TcpConnection(const std::string &name, EventLoop *loop, int sockfd, const InetAddress &peerAddr)
     : name_(name), loop_(loop), socket_(sockfd), state_(TcpConnectionState::kConnecting), reading_(false),
@@ -22,6 +24,43 @@ TcpConnection::~TcpConnection()
 void TcpConnection::setState(TcpConnectionState state)
 {
     state_.store(state);
+}
+
+int TcpConnection::fd() const noexcept
+{
+    return socket_.getFd();
+}
+
+void TcpConnection::trackOperation(
+    const std::shared_ptr<ucp::IoOperation> &operation)
+{
+    assert(loop_ && loop_->isInLoopThread());
+    if (operation)
+    {
+        pendingOperations_.insert_or_assign(operation->id(), operation);
+    }
+}
+
+void TcpConnection::untrackOperation(std::uint64_t operationId)
+{
+    assert(loop_ && loop_->isInLoopThread());
+    pendingOperations_.erase(operationId);
+}
+
+void TcpConnection::cancelPendingOperations()
+{
+    assert(loop_ && loop_->isInLoopThread());
+    std::vector<std::shared_ptr<ucp::IoOperation>> operations;
+    operations.reserve(pendingOperations_.size());
+    for (const auto &[id, operation] : pendingOperations_)
+    {
+        (void)id;
+        operations.push_back(operation);
+    }
+    for (const auto &operation : operations)
+    {
+        loop_->cancelOperation(operation);
+    }
 }
 // 重置TcpConnection（未使用）
 void TcpConnection::reset()
@@ -79,7 +118,11 @@ void TcpConnection::forceClose()
     if (state_.compare_exchange_strong(expected, TcpConnectionState::kDisconnecting)) // 原子操作，确保线程安全
     {
         LOG_INFO("TcpConnection::forceClose CAS success, queueing handleClose, conn={}", name_);
-        loop_->queueInLoop(std::bind(&TcpConnection::handleClose, shared_from_this()));
+        auto self = shared_from_this();
+        loop_->queueControlInLoop([self] {
+            self->cancelPendingOperations();
+            self->handleClose();
+        });
     }
     else
     {
@@ -370,6 +413,8 @@ void TcpConnection::connectDestroyed()
         setState(TcpConnectionState::kDisconnected);
     }
     closeCallbackInvoked_.store(true);
+
+    cancelPendingOperations();
 
     // 关键修复：主动关闭底层 Socket 文件描述符
     // 否则如果还有其他地方，

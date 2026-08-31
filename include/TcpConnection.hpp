@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 #include "AsyncRead.hpp"
 #include "AsyncWrite.hpp"
@@ -105,6 +107,11 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     {
         return loop_;
     };
+
+    int fd() const noexcept;
+    void trackOperation(const std::shared_ptr<ucp::IoOperation> &operation);
+    void untrackOperation(std::uint64_t operationId);
+    void cancelPendingOperations();
 
     // 获取本地地址
     InetAddress getLocalAddr() const
@@ -319,6 +326,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection>
     std::string name_;                      // 连接名称
 
     std::atomic<int> pendingSpecialWriteCount_{0}; // 有多少个特殊写请求(非 outputBuffer_ 的)正在被 io_uring 处理
+    std::unordered_map<std::uint64_t, std::shared_ptr<ucp::IoOperation>> pendingOperations_;
 
     std::atomic_bool closeCallbackInvoked_{false}; // 防止关闭回调被重复触发的保护位标志位，防止重复关闭
 
