@@ -131,11 +131,9 @@ Result<std::shared_ptr<TcpConnection>> connectFailure(
         {code, errorNumber, std::move(message)});
 }
 
-} // namespace
-
-Task<Result<std::shared_ptr<TcpConnection>>> asyncConnect(
+Task<Result<std::shared_ptr<TcpConnection>>> connectOwned(
     EventLoop& loop,
-    const InetAddress& peer,
+    sockaddr_in peerAddress,
     std::chrono::steady_clock::time_point deadline,
     std::string connectionName)
 {
@@ -162,7 +160,6 @@ Task<Result<std::shared_ptr<TcpConnection>>> asyncConnect(
             "failed to configure outbound socket");
     }
 
-    const sockaddr_in peerAddress = peer.getSockAddrIn();
     auto result = co_await ConnectAwaitable(
         loop, socket.getFd(), peerAddress, deadline);
     if (!result) {
@@ -176,6 +173,18 @@ Task<Result<std::shared_ptr<TcpConnection>>> asyncConnect(
     connection->connectEstablished();
     co_return Result<std::shared_ptr<TcpConnection>>::success(
         std::move(connection));
+}
+
+} // namespace
+
+Task<Result<std::shared_ptr<TcpConnection>>> asyncConnect(
+    EventLoop& loop,
+    const InetAddress& peer,
+    std::chrono::steady_clock::time_point deadline,
+    std::string connectionName)
+{
+    return connectOwned(
+        loop, peer.getSockAddrIn(), deadline, std::move(connectionName));
 }
 
 } // namespace ucp

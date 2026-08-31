@@ -13,18 +13,17 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 using namespace std::chrono_literals;
+using ConnectTask =
+    ucp::Task<ucp::Result<std::shared_ptr<TcpConnection>>>;
 
 ucp::DetachedTask connectSuccessfully(
-    EventLoop& loop,
-    std::uint16_t port,
+    ConnectTask task,
     std::atomic_bool& completed)
 {
-    auto connected = co_await ucp::asyncConnect(
-        loop, InetAddress(port, "127.0.0.1"),
-        std::chrono::steady_clock::now() + 500ms,
-        "connect-test");
+    auto connected = co_await std::move(task);
     CHECK(connected);
     CHECK(connected.value()->isConnected());
     connected.value()->connectDestroyed();
@@ -88,8 +87,13 @@ int main()
     EventLoop* loop = thread.startLoop();
 
     std::atomic_bool connected{false};
-    loop->queueControlInLoop([&] {
-        connectSuccessfully(*loop, port, connected);
+    auto pendingConnect = std::make_shared<ConnectTask>(
+        ucp::asyncConnect(
+            *loop, InetAddress(port, "127.0.0.1"),
+            std::chrono::steady_clock::now() + 500ms,
+            "connect-test"));
+    loop->queueControlInLoop([pendingConnect, &connected] {
+        connectSuccessfully(std::move(*pendingConnect), connected);
     });
     CHECK(TestSupport::waitUntil(
         [&] { return connected.load(std::memory_order_acquire); }, 2s));
