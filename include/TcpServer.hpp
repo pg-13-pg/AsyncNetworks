@@ -36,6 +36,11 @@ class TcpServer
 
     void start();                                               // 启动服务器，开始监听新连接
     void setThreadNum(int numThreads);                          // 设置工作线程数量
+    void setThreadInitCallback(EventLoopThreadPool::ThreadInitCallback cb);
+    void stopAccepting();
+    void forEachConnection(
+        const std::function<void(const std::shared_ptr<TcpConnection> &)> &cb);
+    std::size_t connectionCount() const noexcept;
     void setEventLoopOptions(const EventLoop::Options &options) // 设置EventLoop的配置选项
     {
         threadPool_.setEventLoopOptions(options);
@@ -60,11 +65,14 @@ class TcpServer
     std::unique_ptr<Acceptor> acceptor_;    // 负责监听和接受新连接的 Acceptor 对象
     ConnectionCallback connectionCallback_; // 用户设置的新连接业务回调
     std::atomic_bool started_;              // 服务器是否已启动
+    std::atomic_bool accepting_{false};
+    std::atomic_size_t connectionCount_{0};
 
     int nextConnId_; // 下一个连接的 ID，用于生成唯一连接名称
 
     std::unordered_map<std::string, std::shared_ptr<TcpConnection>>
         connections_; // 活动连接列表，key是连接名称，value是 TcpConnection 对象，使用shared_ptr保证连接在断开前不被析构
     EventLoopThreadPool threadPool_;              // 线程池，每个线程运行一个 EventLoop
+    EventLoopThreadPool::ThreadInitCallback threadInitCallback_;
     std::chrono::milliseconds readTimeout_{5000}; // 读超时时间
 };

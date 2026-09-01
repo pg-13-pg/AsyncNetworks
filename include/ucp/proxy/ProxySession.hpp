@@ -7,6 +7,8 @@
 #include "ucp/proxy/UpstreamPool.hpp"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -15,6 +17,8 @@
 class TcpConnection;
 
 namespace ucp::proxy {
+
+struct GatewayMetricShard;
 
 class ProxySession : public std::enable_shared_from_this<ProxySession> {
 public:
@@ -27,7 +31,8 @@ public:
         RoundRobinBalancer& balancer,
         UpstreamPool& pool,
         const HttpLimits& limits,
-        FinishCallback onFinished);
+        FinishCallback onFinished,
+        GatewayMetricShard* metrics = nullptr);
 
     DetachedTask run();
     void cancel();
@@ -42,10 +47,14 @@ private:
         Buffer& sourceBuffer,
         const std::shared_ptr<TcpConnection>& destination,
         std::size_t bytes,
-        Deadline deadline);
+        Deadline deadline,
+        std::atomic_uint64_t* transferredBytes = nullptr);
     Task<IoResult> sendError(int status, std::string_view reason);
     void cancelInLoop();
     void finish(const std::shared_ptr<ProxySession>& self);
+    void recordStatus(int status) noexcept;
+    void recordError(const Error& error) noexcept;
+    void recordLatency() noexcept;
 
     std::shared_ptr<TcpConnection> downstream_;
     const RouteTable& routes_;
@@ -53,6 +62,7 @@ private:
     UpstreamPool& pool_;
     HttpLimits limits_;
     FinishCallback onFinished_;
+    GatewayMetricShard* metrics_{nullptr};
     Buffer downstreamInput_;
     Buffer upstreamInput_;
     std::array<std::byte, 16 * 1024> scratch_{};
@@ -62,6 +72,8 @@ private:
     bool cancelled_{false};
     bool responseStarted_{false};
     bool finished_{false};
+    bool requestInProgress_{false};
+    std::chrono::steady_clock::time_point requestStartedAt_{};
 };
 
 } // namespace ucp::proxy

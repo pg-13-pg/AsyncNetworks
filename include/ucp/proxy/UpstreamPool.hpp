@@ -11,13 +11,19 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 class EventLoop;
 class TcpConnection;
 
+namespace ucp {
+class AsyncConnectControl;
+}
+
 namespace ucp::proxy {
 
 class UpstreamPool;
+struct GatewayMetricShard;
 
 class UpstreamLease {
 public:
@@ -49,7 +55,8 @@ private:
 
 class UpstreamPool {
 public:
-    explicit UpstreamPool(EventLoop& loop);
+    explicit UpstreamPool(
+        EventLoop& loop, GatewayMetricShard* metrics = nullptr);
     UpstreamPool(const UpstreamPool&) = delete;
     UpstreamPool& operator=(const UpstreamPool&) = delete;
 
@@ -58,6 +65,8 @@ public:
         const Endpoint& endpoint,
         std::chrono::steady_clock::time_point deadline);
 
+    void stopAcquiring();
+    void cancelPendingAcquisitions();
     void closeIdle();
     std::size_t active(
         const Route& route, const Endpoint& endpoint) const;
@@ -91,6 +100,9 @@ private:
         const std::shared_ptr<TcpConnection>& connection) noexcept;
 
     EventLoop& loop_;
+    GatewayMetricShard* metrics_;
+    bool accepting_{true};
+    std::unordered_set<AsyncConnectControl*> connectingControls_;
     std::unordered_map<std::string, Bucket> buckets_;
     std::uint64_t nextConnectionId_{1};
 };

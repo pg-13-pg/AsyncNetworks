@@ -7,6 +7,7 @@
 #include "ucp/runtime/IoOperation.hpp"
 
 #include <cerrno>
+#include <cassert>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
@@ -54,11 +55,13 @@ public:
         EventLoop& loop,
         int fd,
         const sockaddr_in& peerAddress,
-        std::chrono::steady_clock::time_point deadline)
+        std::chrono::steady_clock::time_point deadline,
+        AsyncConnectControl* control)
         : loop_(loop)
         , fd_(fd)
         , peerAddress_(peerAddress)
         , deadline_(deadline)
+        , control_(control)
     {
     }
 
@@ -75,6 +78,12 @@ public:
                  "connect submission must run on the owning EventLoop"}));
             return false;
         }
+        if (control_ && control_->cancellationRequested()) {
+            immediateResult_.emplace(IoResult::failure(
+                {ErrorCode::cancelled, ECANCELED,
+                 "connect cancelled before submission"}));
+            return false;
+        }
 
         auto operation = std::make_shared<ConnectOperation>(
             loop_.nextOperationId(), peerAddress_);
@@ -87,6 +96,9 @@ public:
         }
 
         operation->setContinuation(continuation);
+        if (control_) {
+            control_->attach(operation);
+        }
         const auto submitted = loop_.submitOperation(
             operation, 2,
             [fd = fd_, operation, deadline = deadline_](
@@ -103,12 +115,19 @@ public:
                 io_uring_prep_link_timeout(
                     sqes[1], &operation->timeout, 0);
             });
+        if (submitted.disposition == EventLoop::SubmitDisposition::rejected
+            && control_) {
+            control_->detach();
+        }
         return submitted.disposition
             != EventLoop::SubmitDisposition::rejected;
     }
 
     IoResult await_resume()
     {
+        if (control_) {
+            control_->detach();
+        }
         if (immediateResult_) {
             return std::move(*immediateResult_);
         }
@@ -122,6 +141,7 @@ private:
     std::chrono::steady_clock::time_point deadline_;
     std::shared_ptr<ConnectOperation> operation_;
     std::optional<IoResult> immediateResult_;
+    AsyncConnectControl* control_;
 };
 
 Result<std::shared_ptr<TcpConnection>> connectFailure(
@@ -135,7 +155,8 @@ Task<Result<std::shared_ptr<TcpConnection>>> connectOwned(
     EventLoop& loop,
     sockaddr_in peerAddress,
     std::chrono::steady_clock::time_point deadline,
-    std::string connectionName)
+    std::string connectionName,
+    AsyncConnectControl* control)
 {
     if (!loop.isInLoopThread()) {
         co_return connectFailure(
@@ -161,7 +182,7 @@ Task<Result<std::shared_ptr<TcpConnection>>> connectOwned(
     }
 
     auto result = co_await ConnectAwaitable(
-        loop, socket.getFd(), peerAddress, deadline);
+        loop, socket.getFd(), peerAddress, deadline, control);
     if (!result) {
         co_return Result<std::shared_ptr<TcpConnection>>::failure(
             result.error());
@@ -177,14 +198,47 @@ Task<Result<std::shared_ptr<TcpConnection>>> connectOwned(
 
 } // namespace
 
+AsyncConnectControl::AsyncConnectControl(EventLoop& loop) noexcept
+    : loop_(loop)
+{
+}
+
+void AsyncConnectControl::cancel()
+{
+    assert(loop_.isInLoopThread());
+    cancellationRequested_ = true;
+    if (auto operation = operation_.lock()) {
+        loop_.cancelOperation(operation);
+    }
+}
+
+bool AsyncConnectControl::cancellationRequested() const noexcept
+{
+    return cancellationRequested_;
+}
+
+void AsyncConnectControl::attach(
+    const std::shared_ptr<IoOperation>& operation)
+{
+    assert(loop_.isInLoopThread());
+    operation_ = operation;
+}
+
+void AsyncConnectControl::detach() noexcept
+{
+    operation_.reset();
+}
+
 Task<Result<std::shared_ptr<TcpConnection>>> asyncConnect(
     EventLoop& loop,
     const InetAddress& peer,
     std::chrono::steady_clock::time_point deadline,
-    std::string connectionName)
+    std::string connectionName,
+    AsyncConnectControl* control)
 {
     return connectOwned(
-        loop, peer.getSockAddrIn(), deadline, std::move(connectionName));
+        loop, peer.getSockAddrIn(), deadline, std::move(connectionName),
+        control);
 }
 
 } // namespace ucp

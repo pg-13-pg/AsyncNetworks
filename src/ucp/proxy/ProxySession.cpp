@@ -2,6 +2,7 @@
 
 #include "EventLoop.hpp"
 #include "TcpConnection.hpp"
+#include "ucp/proxy/GatewayMetrics.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -94,13 +95,15 @@ ProxySession::ProxySession(
     RoundRobinBalancer& balancer,
     UpstreamPool& pool,
     const HttpLimits& limits,
-    FinishCallback onFinished)
+    FinishCallback onFinished,
+    GatewayMetricShard* metrics)
     : downstream_(std::move(downstream))
     , routes_(routes)
     , balancer_(balancer)
     , pool_(pool)
     , limits_(limits)
     , onFinished_(std::move(onFinished))
+    , metrics_(metrics)
 {
 }
 
@@ -124,9 +127,12 @@ Task<void> ProxySession::runLoop()
 {
     while (!cancelled_) {
         responseStarted_ = false;
+        requestStartedAt_ = std::chrono::steady_clock::now();
+        requestInProgress_ = false;
         auto requestResult = co_await readRequestHead();
         if (!requestResult) {
             const auto error = requestResult.error();
+            recordError(error);
             if (error.code != ErrorCode::eof
                 && error.code != ErrorCode::cancelled) {
                 const int status = requestErrorStatus(error);
@@ -135,6 +141,10 @@ Task<void> ProxySession::runLoop()
             break;
         }
         auto request = std::move(requestResult).takeValue();
+        requestInProgress_ = true;
+        if (metrics_) {
+            metrics_->requests.fetch_add(1, std::memory_order_relaxed);
+        }
 
         const Route* route = routes_.match(request.path);
         if (!route) {
@@ -169,6 +179,7 @@ Task<void> ProxySession::runLoop()
             currentUpstream_, bytesOf(request.forwardHead),
             responseDeadline_);
         if (!writeHead) {
+            recordError(writeHead.error());
             const int status = writeHead.error().code == ErrorCode::timedOut
                 ? 504
                 : 502;
@@ -176,11 +187,17 @@ Task<void> ProxySession::runLoop()
             currentUpstream_.reset();
             break;
         }
+        if (metrics_) {
+            metrics_->bytesFromClients.fetch_add(
+                writeHead.value(), std::memory_order_relaxed);
+        }
 
         auto upload = co_await streamExact(
             downstream_, downstreamInput_, currentUpstream_,
-            request.contentLength, responseDeadline_);
+            request.contentLength, responseDeadline_,
+            metrics_ ? &metrics_->bytesFromClients : nullptr);
         if (!upload) {
+            recordError(upload.error());
             const int status = upload.error().code == ErrorCode::timedOut
                 ? 504
                 : (upload.error().code == ErrorCode::protocol ? 400 : 502);
@@ -192,6 +209,7 @@ Task<void> ProxySession::runLoop()
         upstreamInput_.reset();
         auto responseResult = co_await readResponseHead(currentUpstream_);
         if (!responseResult) {
+            recordError(responseResult.error());
             const int status =
                 responseResult.error().code == ErrorCode::timedOut
                 ? 504
@@ -209,16 +227,26 @@ Task<void> ProxySession::runLoop()
         auto downstreamHead = co_await asyncWriteAll(
             downstream_, bytesOf(response.forwardHead), responseDeadline_);
         if (!downstreamHead) {
+            recordError(downstreamHead.error());
             currentUpstream_.reset();
             break;
+        }
+        if (metrics_) {
+            metrics_->bytesToClients.fetch_add(
+                downstreamHead.value(), std::memory_order_relaxed);
         }
         auto download = co_await streamExact(
             currentUpstream_, upstreamInput_, downstream_,
-            response.contentLength, responseDeadline_);
+            response.contentLength, responseDeadline_,
+            metrics_ ? &metrics_->bytesToClients : nullptr);
         if (!download) {
+            recordError(download.error());
             currentUpstream_.reset();
             break;
         }
+
+        recordStatus(response.statusCode);
+        recordLatency();
 
         if (keepAlive) {
             lease.markReusable();
@@ -307,7 +335,8 @@ Task<IoResult> ProxySession::streamExact(
     Buffer& sourceBuffer,
     const std::shared_ptr<TcpConnection>& destination,
     std::size_t bytes,
-    Deadline deadline)
+    Deadline deadline,
+    std::atomic_uint64_t* transferredBytes)
 {
     std::size_t transferred = 0;
     while (transferred < bytes) {
@@ -319,6 +348,10 @@ Task<IoResult> ProxySession::streamExact(
                 bytesOf(sourceBuffer.readBeginAddr(), count), deadline);
             if (!write) {
                 co_return IoResult::failure(write.error());
+            }
+            if (transferredBytes) {
+                transferredBytes->fetch_add(
+                    write.value(), std::memory_order_relaxed);
             }
             sourceBuffer.retrieve(count);
             transferred += count;
@@ -344,6 +377,10 @@ Task<IoResult> ProxySession::streamExact(
         if (!write) {
             co_return IoResult::failure(write.error());
         }
+        if (transferredBytes) {
+            transferredBytes->fetch_add(
+                write.value(), std::memory_order_relaxed);
+        }
         transferred += read.value();
     }
     co_return IoResult::success(transferred);
@@ -362,9 +399,18 @@ Task<IoResult> ProxySession::sendError(
         + std::string(reason)
         + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     responseStarted_ = true;
-    co_return co_await asyncWriteAll(
+    auto written = co_await asyncWriteAll(
         downstream_, bytesOf(response),
         std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    if (written) {
+        if (metrics_) {
+            metrics_->bytesToClients.fetch_add(
+                written.value(), std::memory_order_relaxed);
+        }
+        recordStatus(status);
+        recordLatency();
+    }
+    co_return written;
 }
 
 void ProxySession::cancel()
@@ -407,6 +453,54 @@ void ProxySession::finish(const std::shared_ptr<ProxySession>& self)
     if (onFinished_) {
         onFinished_(self);
     }
+}
+
+void ProxySession::recordStatus(int status) noexcept
+{
+    if (!metrics_) {
+        return;
+    }
+    if (status >= 200 && status < 300) {
+        metrics_->status2xx.fetch_add(1, std::memory_order_relaxed);
+    } else if (status >= 400 && status < 500) {
+        metrics_->status4xx.fetch_add(1, std::memory_order_relaxed);
+    } else if (status >= 500 && status < 600) {
+        metrics_->status5xx.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void ProxySession::recordError(const Error& error) noexcept
+{
+    if (!metrics_) {
+        return;
+    }
+    switch (error.code) {
+    case ErrorCode::protocol:
+        metrics_->protocolErrors.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case ErrorCode::timedOut:
+        metrics_->timeoutErrors.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case ErrorCode::cancelled:
+        metrics_->cancellations.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case ErrorCode::resourceExhausted:
+        metrics_->overloadErrors.fetch_add(1, std::memory_order_relaxed);
+        break;
+    default:
+        break;
+    }
+}
+
+void ProxySession::recordLatency() noexcept
+{
+    if (!metrics_ || !requestInProgress_) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - requestStartedAt_);
+    metrics_->recordLatency(elapsed.count());
+    requestInProgress_ = false;
 }
 
 } // namespace ucp::proxy

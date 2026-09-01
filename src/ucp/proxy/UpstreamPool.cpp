@@ -3,11 +3,13 @@
 #include "EventLoop.hpp"
 #include "TcpConnection.hpp"
 #include "ucp/net/AsyncConnect.hpp"
+#include "ucp/proxy/GatewayMetrics.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <utility>
+#include <vector>
 
 namespace ucp::proxy {
 namespace {
@@ -79,8 +81,9 @@ void UpstreamLease::release() noexcept
     }
 }
 
-UpstreamPool::UpstreamPool(EventLoop& loop)
+UpstreamPool::UpstreamPool(EventLoop& loop, GatewayMetricShard* metrics)
     : loop_(loop)
+    , metrics_(metrics)
 {
 }
 
@@ -119,6 +122,10 @@ void UpstreamPool::pruneIdle(Bucket& bucket)
             position = bucket.idleConnections.erase(position);
             assert(bucket.totalCount > 0);
             --bucket.totalCount;
+            if (metrics_) {
+                metrics_->poolIdleConnections.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
             closeConnection(connection);
         } else {
             ++position;
@@ -136,6 +143,11 @@ Task<Result<UpstreamLease>> UpstreamPool::acquire(
             ErrorCode::system, EPERM,
             "upstream pool must run on its owning EventLoop");
     }
+    if (!accepting_) {
+        co_return poolFailure(
+            ErrorCode::cancelled, ECANCELED,
+            "upstream pool is draining");
+    }
     if (deadline <= std::chrono::steady_clock::now()) {
         co_return poolFailure(
             ErrorCode::timedOut, ETIMEDOUT,
@@ -150,12 +162,24 @@ Task<Result<UpstreamLease>> UpstreamPool::acquire(
             bucket.idleConnections.front().connection);
         bucket.idleConnections.pop_front();
         ++bucket.leasedCount;
+        if (metrics_) {
+            metrics_->poolAcquisitions.fetch_add(
+                1, std::memory_order_relaxed);
+            metrics_->poolReuses.fetch_add(1, std::memory_order_relaxed);
+            metrics_->poolIdleConnections.fetch_sub(
+                1, std::memory_order_relaxed);
+            metrics_->poolActiveConnections.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         co_return Result<UpstreamLease>::success(
             UpstreamLease(this, key, endpoint, std::move(connection)));
     }
 
     if (bucket.totalCount + bucket.connectingCount
         >= bucket.maxConnections) {
+        if (metrics_) {
+            metrics_->overloadErrors.fetch_add(1, std::memory_order_relaxed);
+        }
         co_return poolFailure(
             ErrorCode::resourceExhausted, EAGAIN,
             "upstream connection capacity exhausted");
@@ -174,20 +198,65 @@ Task<Result<UpstreamLease>> UpstreamPool::acquire(
     const auto connectDeadline = std::min(
         deadline,
         std::chrono::steady_clock::now() + route.connectTimeout);
+    AsyncConnectControl connectControl(loop_);
+    connectingControls_.insert(&connectControl);
+    struct ConnectControlReservation {
+        std::unordered_set<AsyncConnectControl*>& controls;
+        AsyncConnectControl* control;
+        ~ConnectControlReservation()
+        {
+            controls.erase(control);
+        }
+    } connectReservation{connectingControls_, &connectControl};
     auto connected = co_await asyncConnect(
         loop_, endpoint.address(), connectDeadline,
         "upstream-" + endpoint.key() + '-'
-            + std::to_string(nextConnectionId_++));
+            + std::to_string(nextConnectionId_++),
+        &connectControl);
     if (!connected) {
+        if (metrics_) {
+            if (connected.error().code == ErrorCode::timedOut) {
+                metrics_->timeoutErrors.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else if (connected.error().code == ErrorCode::cancelled) {
+                metrics_->cancellations.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                metrics_->connectErrors.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
         co_return Result<UpstreamLease>::failure(connected.error());
     }
 
     ++bucket.totalCount;
     ++bucket.leasedCount;
+    if (metrics_) {
+        metrics_->poolAcquisitions.fetch_add(
+            1, std::memory_order_relaxed);
+        metrics_->poolActiveConnections.fetch_add(
+            1, std::memory_order_relaxed);
+    }
     co_return Result<UpstreamLease>::success(
         UpstreamLease(
             this, key, endpoint,
             std::move(connected).takeValue()));
+}
+
+void UpstreamPool::stopAcquiring()
+{
+    assert(loop_.isInLoopThread());
+    accepting_ = false;
+}
+
+void UpstreamPool::cancelPendingAcquisitions()
+{
+    assert(loop_.isInLoopThread());
+    std::vector<AsyncConnectControl*> controls(
+        connectingControls_.begin(), connectingControls_.end());
+    for (AsyncConnectControl* control : controls) {
+        control->cancel();
+    }
 }
 
 void UpstreamPool::release(UpstreamLease& lease) noexcept
@@ -200,6 +269,10 @@ void UpstreamPool::release(UpstreamLease& lease) noexcept
     assert(bucket.leasedCount > 0);
     assert(bucket.totalCount > 0);
     --bucket.leasedCount;
+    if (metrics_) {
+        metrics_->poolActiveConnections.fetch_sub(
+            1, std::memory_order_relaxed);
+    }
 
     auto connection = std::move(lease.connection_);
     if (lease.reusable_ && connection && connection->isConnected()
@@ -207,6 +280,10 @@ void UpstreamPool::release(UpstreamLease& lease) noexcept
         try {
             bucket.idleConnections.push_back(
                 {connection, std::chrono::steady_clock::now()});
+            if (metrics_) {
+                metrics_->poolIdleConnections.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             connection.reset();
         } catch (...) {
             // A noexcept lease destructor must degrade to discard on
@@ -242,6 +319,10 @@ void UpstreamPool::closeIdle()
             bucket.idleConnections.pop_front();
             assert(bucket.totalCount > 0);
             --bucket.totalCount;
+            if (metrics_) {
+                metrics_->poolIdleConnections.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
             closeConnection(connection);
         }
     }

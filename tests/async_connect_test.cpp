@@ -45,6 +45,22 @@ ucp::DetachedTask connectToReleasedPort(
     completed.store(true, std::memory_order_release);
 }
 
+ucp::DetachedTask connectWithPreCancelledControl(
+    EventLoop& loop,
+    std::uint16_t port,
+    std::atomic_bool& completed)
+{
+    ucp::AsyncConnectControl control(loop);
+    control.cancel();
+    auto cancelled = co_await ucp::asyncConnect(
+        loop, InetAddress(port, "127.0.0.1"),
+        std::chrono::steady_clock::now() + 500ms,
+        "cancelled-connect-test", &control);
+    CHECK(!cancelled);
+    CHECK_EQ(cancelled.error().code, ucp::ErrorCode::cancelled);
+    completed.store(true, std::memory_order_release);
+}
+
 int main()
 {
     const int listener = ::socket(
@@ -106,6 +122,13 @@ int main()
     });
     CHECK(TestSupport::waitUntil(
         [&] { return refused.load(std::memory_order_acquire); }, 2s));
+
+    std::atomic_bool cancelled{false};
+    loop->queueControlInLoop([&] {
+        connectWithPreCancelledControl(*loop, port, cancelled);
+    });
+    CHECK(TestSupport::waitUntil(
+        [&] { return cancelled.load(std::memory_order_acquire); }, 2s));
 
     loop->quit();
     return 0;

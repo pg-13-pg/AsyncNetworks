@@ -187,6 +187,20 @@ ucp::DetachedTask exercisePool(
     completed.store(true, std::memory_order_release);
 }
 
+ucp::DetachedTask verifyStoppedPoolRejectsAcquisition(
+    proxy::UpstreamPool& pool,
+    const proxy::Route& route,
+    const proxy::Endpoint& endpoint,
+    std::atomic_bool& completed)
+{
+    pool.stopAcquiring();
+    auto rejected = co_await pool.acquire(
+        route, endpoint, std::chrono::steady_clock::now() + 500ms);
+    CHECK(!rejected);
+    CHECK_EQ(rejected.error().code, ucp::ErrorCode::cancelled);
+    completed.store(true, std::memory_order_release);
+}
+
 } // namespace
 
 int main()
@@ -246,6 +260,16 @@ int main()
         [&] { return completed.load(std::memory_order_acquire); }, 5s));
     CHECK(TestSupport::waitUntil(
         [&] { return listener.accepts() == 4; }, 2s));
+
+    std::atomic_bool stoppedPoolChecked{false};
+    loop->queueControlInLoop([&] {
+        verifyStoppedPoolRejectsAcquisition(
+            pool, route, endpoint, stoppedPoolChecked);
+    });
+    CHECK(TestSupport::waitUntil(
+        [&] {
+            return stoppedPoolChecked.load(std::memory_order_acquire);
+        }, 2s));
     loop->quit();
     return 0;
 }
