@@ -60,6 +60,9 @@ public:
               InetAddress(config_.listenPort, config_.listenIp),
               "ucp-gateway"))
     {
+        server_->setConnectionDestroyedCallback([this] {
+            notifyShutdownWaiters();
+        });
     }
 
     ~Impl()
@@ -158,8 +161,7 @@ public:
             }
         }
 
-        const auto forcedDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto forcedDeadline = forcedPhaseDeadline();
         postBaseAndWait(
             [this] {
                 server_->forEachConnection(
@@ -170,6 +172,7 @@ public:
             forcedDeadline, "force downstream close");
         waitForConnectionsToClose(forcedDeadline);
 
+        forcedDeadline = forcedPhaseDeadline();
         runOnWorkersAndWait(
             workers,
             [](GatewayWorker& worker) {
@@ -188,6 +191,7 @@ public:
             },
             forcedDeadline, "close idle upstream connections");
 
+        forcedDeadline = forcedPhaseDeadline();
         waitForOperationDrain(workers, forcedDeadline);
         {
             std::lock_guard<std::mutex> lock(workersMutex_);
@@ -197,14 +201,15 @@ public:
             }
         }
 
+        forcedDeadline = forcedPhaseDeadline();
         waitForBaseOperationDrain(forcedDeadline);
         baseLoop_.quit();
 
         {
             std::lock_guard<std::mutex> lock(shutdownMutex_);
             stopped_.store(true, std::memory_order_release);
+            shutdownCv_.notify_all();
         }
-        shutdownCv_.notify_all();
     }
 
     GatewayMetricsSnapshot metrics() const
@@ -268,7 +273,7 @@ private:
                 worker->metrics.activeConnections.fetch_sub(
                     1, std::memory_order_relaxed);
                 activeSessions_.fetch_sub(1, std::memory_order_release);
-                shutdownCv_.notify_all();
+                notifyShutdownWaiters();
             },
             &worker->metrics);
         worker->sessions.emplace(session.get(), session);
@@ -294,20 +299,33 @@ private:
         std::abort();
     }
 
+    static std::chrono::steady_clock::time_point forcedPhaseDeadline()
+    {
+        return std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    }
+
+    void notifyShutdownWaiters()
+    {
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+        shutdownCv_.notify_all();
+    }
+
     void postBaseAndWait(
         std::function<void()> action,
         std::chrono::steady_clock::time_point deadline,
         const char* phase)
     {
         bool complete = false;
-        baseLoop_.queueControlInLoop([&, action = std::move(action)] {
+        if (!baseLoop_.queueControlInLoop([&, action = std::move(action)] {
             action();
             {
                 std::lock_guard<std::mutex> lock(shutdownMutex_);
                 complete = true;
+                shutdownCv_.notify_all();
             }
-            shutdownCv_.notify_all();
-        });
+        })) {
+            failStop(phase);
+        }
         std::unique_lock<std::mutex> lock(shutdownMutex_);
         if (!shutdownCv_.wait_until(lock, deadline, [&] { return complete; })) {
             failStop(phase);
@@ -338,13 +356,11 @@ private:
     void waitForConnectionsToClose(
         std::chrono::steady_clock::time_point deadline)
     {
-        while (server_->connectionCount() != 0) {
-            std::unique_lock<std::mutex> lock(shutdownMutex_);
-            if (shutdownCv_.wait_until(lock, deadline)
-                == std::cv_status::timeout
-                && server_->connectionCount() != 0) {
-                failStop("publish connection destruction");
-            }
+        std::unique_lock<std::mutex> lock(shutdownMutex_);
+        if (!shutdownCv_.wait_until(lock, deadline, [this] {
+                return server_->connectionCount() == 0;
+            })) {
+            failStop("publish connection destruction");
         }
     }
 
@@ -356,14 +372,16 @@ private:
     {
         std::size_t complete = 0;
         for (GatewayWorker* worker : workers) {
-            worker->loop.queueControlInLoop([&, worker, action] {
+            if (!worker->loop.queueControlInLoop([&, worker, action] {
                 action(*worker);
                 {
                     std::lock_guard<std::mutex> lock(shutdownMutex_);
                     ++complete;
+                    shutdownCv_.notify_all();
                 }
-                shutdownCv_.notify_all();
-            });
+            })) {
+                failStop(phase);
+            }
         }
         std::unique_lock<std::mutex> lock(shutdownMutex_);
         if (!shutdownCv_.wait_until(lock, deadline, [&] {
@@ -388,17 +406,21 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(shutdownMutex_);
                         ++ready;
+                        shutdownCv_.notify_all();
                     }
-                    shutdownCv_.notify_all();
                     return;
                 }
-                worker->loop.queueControlInLoop([weakPoll] {
+                if (!worker->loop.queueControlInLoop([weakPoll] {
                     if (auto retry = weakPoll.lock()) {
                         (*retry)();
                     }
-                });
+                })) {
+                    failStop("drain worker operations");
+                }
             };
-            worker->loop.queueControlInLoop(*poll);
+            if (!worker->loop.queueControlInLoop(*poll)) {
+                failStop("drain worker operations");
+            }
             polls.push_back(std::move(poll));
         }
         std::unique_lock<std::mutex> lock(shutdownMutex_);
@@ -420,17 +442,21 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(shutdownMutex_);
                     ready = true;
+                    shutdownCv_.notify_all();
                 }
-                shutdownCv_.notify_all();
                 return;
             }
-            baseLoop_.queueControlInLoop([weakPoll] {
+            if (!baseLoop_.queueControlInLoop([weakPoll] {
                 if (auto retry = weakPoll.lock()) {
                     (*retry)();
                 }
-            });
+            })) {
+                failStop("drain base operations");
+            }
         };
-        baseLoop_.queueControlInLoop(*poll);
+        if (!baseLoop_.queueControlInLoop(*poll)) {
+            failStop("drain base operations");
+        }
         std::unique_lock<std::mutex> lock(shutdownMutex_);
         if (!shutdownCv_.wait_until(lock, deadline, [&] { return ready; })) {
             failStop("drain base operations");
@@ -440,10 +466,10 @@ private:
     EventLoop& baseLoop_;
     GatewayConfig config_;
     RouteTable routes_;
+    std::unique_ptr<TcpServer> server_;
     mutable std::mutex workersMutex_;
     std::unordered_map<EventLoop*, std::unique_ptr<GatewayWorker>> workers_;
     bool loopsStopped_{false};
-    std::unique_ptr<TcpServer> server_;
     std::atomic_bool started_{false};
     std::atomic_bool acceptingSessions_{false};
     std::atomic_size_t activeSessions_{0};

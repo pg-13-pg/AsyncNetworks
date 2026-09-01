@@ -119,10 +119,15 @@ void TcpConnection::forceClose()
     {
         LOG_INFO("TcpConnection::forceClose CAS success, queueing handleClose, conn={}", name_);
         auto self = shared_from_this();
-        loop_->queueControlInLoop([self] {
+        if (!loop_->queueControlInLoop([self] {
             self->cancelPendingOperations();
             self->handleClose();
-        });
+        }))
+        {
+            LOG_ERROR(
+                "TcpConnection::forceClose rejected by stopping EventLoop, conn={}",
+                name_);
+        }
     }
     else
     {

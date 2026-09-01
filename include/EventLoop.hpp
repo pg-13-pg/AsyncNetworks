@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -79,7 +80,7 @@ class EventLoop
     bool runInLoop(Functor cb);
     // 把回调放入任务队列，并唤醒对应的 enentLoop 线程执行
     bool queueInLoop(Functor cb);
-    void queueControlInLoop(Functor cb);
+    bool queueControlInLoop(Functor cb);
     bool isInLoopThread() const noexcept;
 
     std::uint64_t nextOperationId() noexcept;
@@ -91,9 +92,6 @@ class EventLoop
 
     // 协程恢复逻辑，当 io_uring_wait_cqe 返回时调用
     void handleCompletionEvent(struct io_uring_cqe *cqe);
-
-    // 唤醒 Loop 所在线程
-    void wakeup();
 
     // 初始化缓冲区池
     bool initRegisteredBuffers();
@@ -128,6 +126,14 @@ class EventLoop
     struct io_uring ring_;
 
   private:
+    enum class LifecycleState
+    {
+        initialized,
+        running,
+        stopping,
+        stopped
+    };
+
     // io_uring I/O完成时，需要唤醒子线程
     void handleWakeup();
     // 执行任务队列中的任务，通常是建立新连接
@@ -144,6 +150,10 @@ class EventLoop
     void retryCancel(const std::shared_ptr<ucp::IoOperation> &operation);
     // 提交异步读操作以监听 wakeupFd_
     void asyncReadWakeup();
+    void wakeup();
+    void beginStopping(bool wakeLoop);
+    void drainOperationsForShutdown();
+    void releaseResources();
 
     struct PendingSubmission
     {
@@ -155,6 +165,9 @@ class EventLoop
     Options options_;          // 配置
     std::atomic_bool running_; // 事件循环是否在运行
     std::atomic_bool quit_;    // 是否请求退出事件循环
+    std::atomic_bool stoppingRequested_{false};
+    mutable std::shared_mutex lifecycleMutex_;
+    LifecycleState lifecycleState_{LifecycleState::initialized};
     const pid_t threadId_;     // 事件循环所属线程的ID ，使用pid_t更加贴近内核，便于调试
 
     int wakeupFd_;            // 用于唤醒当前 EventLoop 所在线程，实现跨线程任务通知，即eventfd
@@ -185,6 +198,7 @@ class EventLoop
     std::vector<struct iovec> registeredIovecs; // iovec 数组描述的是同一批缓冲区的地址和长度，并用于注册到 io_uring
     bool registeredBuffersInitialized_{false};
     bool registeredBuffersActive_{false};
+    bool resourcesReleased_{false};
 
     // 极致性能优化：单线程模型下无需锁或原子操作，直接用 vector 当栈
     std::vector<int> freeBufferIndices_; // 可用缓冲区索引栈

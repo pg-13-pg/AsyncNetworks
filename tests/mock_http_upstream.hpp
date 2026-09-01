@@ -233,3 +233,226 @@ private:
     std::atomic_size_t accepts_{0};
     std::thread thread_;
 };
+
+class FaultHttpUpstream {
+public:
+    enum class Mode {
+        normal,
+        malformedResponse,
+        delayedResponse,
+        partialResponse,
+        holdResponse,
+        stalledUpload
+    };
+
+    explicit FaultHttpUpstream(
+        Mode mode,
+        std::chrono::milliseconds delay = std::chrono::milliseconds::zero())
+        : mode_(mode), delay_(delay)
+    {
+        listener_ = ::socket(
+            AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        CHECK(listener_ >= 0);
+        int reuse = 1;
+        CHECK_EQ(::setsockopt(
+            listener_, SOL_SOCKET, SO_REUSEADDR,
+            &reuse, sizeof(reuse)), 0);
+        if (mode_ == Mode::stalledUpload) {
+            int receiveBuffer = 1024;
+            CHECK_EQ(::setsockopt(
+                listener_, SOL_SOCKET, SO_RCVBUF,
+                &receiveBuffer, sizeof(receiveBuffer)), 0);
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        CHECK_EQ(::bind(
+            listener_, reinterpret_cast<const sockaddr*>(&address),
+            sizeof(address)), 0);
+        CHECK_EQ(::listen(listener_, 8), 0);
+        socklen_t length = sizeof(address);
+        CHECK_EQ(::getsockname(
+            listener_, reinterpret_cast<sockaddr*>(&address), &length), 0);
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~FaultHttpUpstream()
+    {
+        stop_.store(true, std::memory_order_release);
+        thread_.join();
+        CHECK_EQ(::close(listener_), 0);
+    }
+
+    FaultHttpUpstream(const FaultHttpUpstream&) = delete;
+    FaultHttpUpstream& operator=(const FaultHttpUpstream&) = delete;
+
+    std::uint16_t port() const noexcept { return port_; }
+    std::size_t accepts() const noexcept
+    {
+        return accepts_.load(std::memory_order_acquire);
+    }
+    std::size_t requests() const noexcept
+    {
+        return requests_.load(std::memory_order_acquire);
+    }
+    std::size_t uploadedBodyBytes() const noexcept
+    {
+        return uploadedBodyBytes_.load(std::memory_order_acquire);
+    }
+    bool peerClosed() const noexcept
+    {
+        return peerClosed_.load(std::memory_order_acquire);
+    }
+    void resumeUploadReads() noexcept
+    {
+        resumeUploadReads_.store(true, std::memory_order_release);
+    }
+
+private:
+    bool sendBytes(int connection, std::string_view bytes)
+    {
+        while (!bytes.empty() && !stop_.load(std::memory_order_acquire)) {
+            const auto written = ::send(
+                connection, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+            if (written > 0) {
+                bytes.remove_prefix(static_cast<std::size_t>(written));
+            } else if (written < 0 && (errno == EAGAIN
+                       || errno == EWOULDBLOCK || errno == EINTR)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                return false;
+            }
+        }
+        return bytes.empty();
+    }
+
+    void readUntilPeerClose(int connection)
+    {
+        char buffer[4096];
+        while (!stop_.load(std::memory_order_acquire)) {
+            const auto count = ::recv(connection, buffer, sizeof(buffer), 0);
+            if (count > 0) {
+                uploadedBodyBytes_.fetch_add(
+                    static_cast<std::size_t>(count),
+                    std::memory_order_release);
+            } else if (count == 0) {
+                peerClosed_.store(true, std::memory_order_release);
+                return;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK
+                       || errno == EINTR) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                peerClosed_.store(true, std::memory_order_release);
+                return;
+            }
+        }
+    }
+
+    void drainStalledUpload(int connection)
+    {
+        while (!stop_.load(std::memory_order_acquire)
+               && !resumeUploadReads_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!stop_.load(std::memory_order_acquire)) {
+            readUntilPeerClose(connection);
+        }
+    }
+
+    void run()
+    {
+        int connection = -1;
+        while (!stop_.load(std::memory_order_acquire)) {
+            connection = ::accept4(
+                listener_, nullptr, nullptr,
+                SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (connection >= 0) {
+                accepts_.fetch_add(1, std::memory_order_release);
+                break;
+            }
+            CHECK(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (connection < 0) {
+            return;
+        }
+        if (mode_ == Mode::stalledUpload) {
+            int receiveBuffer = 1024;
+            CHECK_EQ(::setsockopt(
+                connection, SOL_SOCKET, SO_RCVBUF,
+                &receiveBuffer, sizeof(receiveBuffer)), 0);
+        }
+
+        std::string request;
+        while (!stop_.load(std::memory_order_acquire)
+               && request.find("\r\n\r\n") == std::string::npos) {
+            char buffer[4096];
+            const auto count = ::recv(connection, buffer, sizeof(buffer), 0);
+            if (count > 0) {
+                request.append(buffer, static_cast<std::size_t>(count));
+            } else if (count == 0) {
+                peerClosed_.store(true, std::memory_order_release);
+                break;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK
+                       || errno == EINTR) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                break;
+            }
+        }
+        if (request.find("\r\n\r\n") != std::string::npos) {
+            requests_.fetch_add(1, std::memory_order_release);
+            const auto bodyStart = request.find("\r\n\r\n") + 4;
+            uploadedBodyBytes_.fetch_add(
+                request.size() - bodyStart, std::memory_order_release);
+        }
+
+        if (mode_ == Mode::holdResponse) {
+            readUntilPeerClose(connection);
+        } else if (mode_ == Mode::stalledUpload) {
+            drainStalledUpload(connection);
+        } else {
+            const auto sendAt = std::chrono::steady_clock::now() + delay_;
+            while (!stop_.load(std::memory_order_acquire)
+                   && std::chrono::steady_clock::now() < sendAt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (mode_ == Mode::malformedResponse) {
+                (void)sendBytes(
+                    connection,
+                    "BROKEN\r\nContent-Length: 0\r\n\r\n");
+            } else if (mode_ == Mode::partialResponse) {
+                (void)sendBytes(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n"
+                    "Connection: close\r\n\r\nabc");
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                linger reset{1, 0};
+                CHECK_EQ(::setsockopt(
+                    connection, SOL_SOCKET, SO_LINGER,
+                    &reset, sizeof(reset)), 0);
+            } else {
+                (void)sendBytes(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    "Connection: close\r\n\r\nok");
+            }
+        }
+        CHECK_EQ(::close(connection), 0);
+        peerClosed_.store(true, std::memory_order_release);
+    }
+
+    int listener_{-1};
+    std::uint16_t port_{0};
+    Mode mode_;
+    std::chrono::milliseconds delay_;
+    std::atomic_bool stop_{false};
+    std::atomic_bool peerClosed_{false};
+    std::atomic_bool resumeUploadReads_{false};
+    std::atomic_size_t accepts_{0};
+    std::atomic_size_t requests_{0};
+    std::atomic_size_t uploadedBodyBytes_{0};
+    std::thread thread_;
+};

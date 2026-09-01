@@ -54,6 +54,22 @@ private:
     bool tracked_{false};
 };
 
+class PeerCloseAwaitable {
+public:
+    explicit PeerCloseAwaitable(
+        std::shared_ptr<TcpConnection> connection);
+
+    bool await_ready() const noexcept;
+    bool await_suspend(std::coroutine_handle<> continuation);
+    IoResult await_resume();
+
+private:
+    std::shared_ptr<TcpConnection> connection_;
+    std::shared_ptr<IoOperation> operation_;
+    std::optional<IoResult> immediateResult_;
+    bool tracked_{false};
+};
+
 ReadSomeAwaitable asyncReadSome(std::shared_ptr<TcpConnection> connection,
                                 std::span<std::byte> buffer,
                                 Deadline deadline = std::nullopt);
@@ -61,6 +77,9 @@ ReadSomeAwaitable asyncReadSome(std::shared_ptr<TcpConnection> connection,
 WriteSomeAwaitable asyncWriteSome(std::shared_ptr<TcpConnection> connection,
                                   std::span<const std::byte> buffer,
                                   Deadline deadline = std::nullopt);
+
+PeerCloseAwaitable asyncWaitPeerClose(
+    std::shared_ptr<TcpConnection> connection);
 
 Task<IoResult> asyncWriteAll(std::shared_ptr<TcpConnection> connection,
                              std::span<const std::byte> buffer,

@@ -113,7 +113,7 @@ CompletionDecision IoOperation::onCompletion(
             }
         } else if (cancelRequested_
                    && kind == CompletionKind::io
-                   && kernelResult == -ECANCELED) {
+                   && kernelResult < 0) {
             resume = selectResult(IoResult::failure(
                 {ErrorCode::cancelled, ECANCELED, "operation cancelled"}));
         } else if (kind == CompletionKind::timeout) {

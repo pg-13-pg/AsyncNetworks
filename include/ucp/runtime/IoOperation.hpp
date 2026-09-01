@@ -12,6 +12,7 @@ namespace ucp {
 enum class OperationType {
     read,
     write,
+    poll,
     connect,
     accept,
     cancel

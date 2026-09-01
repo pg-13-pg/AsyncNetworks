@@ -13,17 +13,20 @@ EventLoopThread::EventLoopThread(const EventLoop::Options &options, const Thread
 EventLoopThread::~EventLoopThread()
 {
     exiting_ = true;
+    EventLoop *loop = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (loop_ != nullptr)
-        {
-            loop_->quit();
-        }
+        loop = loopOwner_.get();
+    }
+    if (loop != nullptr)
+    {
+        loop->quit();
     }
     if (thread_.joinable())
     {
         thread_.join();
     }
+    loopOwner_.reset();
 }
 
 // 真正创建线程的函数
@@ -34,8 +37,8 @@ EventLoop *EventLoopThread::startLoop()
     EventLoop *loop = nullptr;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        cond_.wait(lock, [this] { return loop_ != nullptr; }); // 主线程执行 ,等待工作线程创建loop直到 loop_ 被设置
-        loop = loop_;
+        cond_.wait(lock, [this] { return ready_; }); // 主线程执行 ,等待工作线程创建loop直到 loop_ 被设置
+        loop = loopOwner_.get();
     }
     return loop;
 }
@@ -43,27 +46,30 @@ EventLoop *EventLoopThread::startLoop()
 // 工作线程的主函数，创建 EventLoop 对象并启动事件循环
 void EventLoopThread::threadFunc()
 {
-    EventLoop loop(options_); // 栈上创建EventLoop对象
+    auto loop = std::make_unique<EventLoop>(options_);
+    EventLoop *loopPtr = loop.get();
 
-    LOG_INFO("EventLoop thread start, loop={}", static_cast<void *>(&loop));
+    LOG_INFO("EventLoop thread start, loop={}", static_cast<void *>(loopPtr));
 
-    if (!loop.initRegisteredBuffers())
+    if (!loopPtr->initRegisteredBuffers())
     {
         LOG_WARN("EventLoop registered-buffer initialization failed; using ordinary buffers");
     }
 
     if (callback_)
     {
-        callback_(&loop); // 执行回调
+        callback_(loopPtr); // 执行回调
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        loop_ = &loop;
+        loopOwner_ = std::move(loop);
+        loop_ = loopPtr;
+        ready_ = true;
     }
     cond_.notify_one();
 
-    loop.loop();
+    loopPtr->loop();
 
     LOG_INFO("EventLoop thread exit");
 

@@ -27,7 +27,17 @@ int main()
     CHECK(cancel.onCompletion(ucp::CompletionKind::io, -ECANCELED).resume);
     CHECK_EQ(cancel.result().error().code, ucp::ErrorCode::cancelled);
 
-    ucp::IoOperation cancelRace(4, ucp::OperationType::write, true);
+    ucp::IoOperation cancelledAfterClose(
+        4, ucp::OperationType::write, false);
+    cancelledAfterClose.arm(1);
+    CHECK(cancelledAfterClose.requestCancel());
+    CHECK(cancelledAfterClose.onCompletion(
+        ucp::CompletionKind::io, -EBADF).resume);
+    CHECK_EQ(
+        cancelledAfterClose.result().error().code,
+        ucp::ErrorCode::cancelled);
+
+    ucp::IoOperation cancelRace(5, ucp::OperationType::write, true);
     cancelRace.arm(2);
     CHECK(cancelRace.requestCancel());
     CHECK(!cancelRace.onCompletion(

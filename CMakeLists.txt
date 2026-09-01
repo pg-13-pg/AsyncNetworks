@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 # 设置项目名称
 project(io_uring_test)
+include(cmake/Sanitizers.cmake)
 
 include(CTest)
 

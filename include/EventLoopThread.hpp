@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -34,8 +35,10 @@ class EventLoopThread
     // void threadFunc(std::promise<EventLoop *> &&p);
     void threadFunc();
 
-    EventLoop *loop_; // 线程中的 EventLoop 对象
+    std::unique_ptr<EventLoop> loopOwner_;
+    EventLoop *loop_; // loopOwner_ 的非拥有观察指针
     bool exiting_;
+    bool ready_{false};
     EventLoop::Options options_;
     std::thread thread_;
     std::mutex mutex_;

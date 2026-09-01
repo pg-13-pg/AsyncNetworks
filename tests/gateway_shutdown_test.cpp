@@ -1,3 +1,5 @@
+#include "Acceptor.hpp"
+#include "TcpServer.hpp"
 #include "EventLoopThread.hpp"
 #include "TestSupport.hpp"
 #include "ucp/proxy/GatewayServer.hpp"
@@ -271,6 +273,51 @@ proxy::GatewayConfig gatewayConfig(
     return config;
 }
 
+void verifyImmediateTcpServerStop()
+{
+    EventLoop::Options options;
+    options.ringEntries = 32;
+    options.sqpoll = false;
+    options.registeredBuffersCount = 0;
+    options.pendingQueueCapacity = 32;
+    options.pendingSubmissionCapacity = 32;
+
+    EventLoop baseLoop(options);
+    const auto port = reservePort();
+    TcpServer server(
+        &baseLoop, InetAddress(port, "127.0.0.1"),
+        "immediate-stop-test");
+
+    std::thread starter([&] { server.start(); });
+    starter.join();
+
+    baseLoop.queueControlInLoop([&] {
+        server.stopAccepting();
+        baseLoop.quit();
+    });
+    baseLoop.loop();
+
+    const int connection = connectTo(port);
+    if (connection >= 0) {
+        CHECK_EQ(::close(connection), 0);
+    }
+    CHECK_EQ(connection, -1);
+}
+
+void verifyAcceptorStopIsTerminal()
+{
+    EventLoop::Options options;
+    options.ringEntries = 32;
+    options.sqpoll = false;
+    options.registeredBuffersCount = 0;
+
+    EventLoop loop(options);
+    Acceptor acceptor(&loop, InetAddress(0, "127.0.0.1"), true);
+    acceptor.stop();
+    acceptor.listen();
+    CHECK(!acceptor.isListening());
+}
+
 void runShutdownCase(
     std::chrono::milliseconds responseDelay, bool expectResponse)
 {
@@ -418,6 +465,8 @@ void verifySignalShutdown()
 int main()
 {
     const auto before = openFdCount();
+    verifyImmediateTcpServerStop();
+    verifyAcceptorStopIsTerminal();
     runShutdownCase(100ms, true);
     runShutdownCase(1200ms, false);
     verifySignalShutdown();

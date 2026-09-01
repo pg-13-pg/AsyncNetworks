@@ -114,6 +114,7 @@ DetachedTask ProxySession::run()
         co_return;
     }
     started_ = true;
+    monitorDownstreamClose(self, downstream_);
     try {
         co_await runLoop();
     } catch (...) {
@@ -121,6 +122,18 @@ DetachedTask ProxySession::run()
         cancelInLoop();
     }
     finish(self);
+}
+
+DetachedTask ProxySession::monitorDownstreamClose(
+    std::weak_ptr<ProxySession> session,
+    std::shared_ptr<TcpConnection> downstream)
+{
+    auto closed = co_await asyncWaitPeerClose(std::move(downstream));
+    if (closed) {
+        if (auto owner = session.lock(); owner && !owner->finished_) {
+            owner->cancelInLoop();
+        }
+    }
 }
 
 Task<void> ProxySession::runLoop()
@@ -424,7 +437,9 @@ void ProxySession::cancel()
         return;
     }
     auto self = shared_from_this();
-    loop->queueControlInLoop([self] { self->cancelInLoop(); });
+    if (!loop->queueControlInLoop([self] { self->cancelInLoop(); })) {
+        LOG_WARN("ProxySession cancellation rejected by stopping EventLoop");
+    }
 }
 
 void ProxySession::cancelInLoop()
@@ -450,6 +465,9 @@ void ProxySession::finish(const std::shared_ptr<ProxySession>& self)
         return;
     }
     finished_ = true;
+    if (downstream_) {
+        downstream_->cancelPendingOperations();
+    }
     if (onFinished_) {
         onFinished_(self);
     }

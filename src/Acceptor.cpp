@@ -56,6 +56,8 @@ struct Acceptor::State : std::enable_shared_from_this<Acceptor::State>
 
     ~State()
     {
+        stopRequested.store(true, std::memory_order_release);
+        stopped.store(true, std::memory_order_release);
         listening.store(false, std::memory_order_release);
         newConnectionCallback = {};
         listenSocket.closeFd();
@@ -64,6 +66,8 @@ struct Acceptor::State : std::enable_shared_from_this<Acceptor::State>
     void listen()
     {
         if (!loop->isInLoopThread()
+            || stopRequested.load(std::memory_order_acquire)
+            || stopped.load(std::memory_order_acquire)
             || listening.exchange(true, std::memory_order_acq_rel))
         {
             return;
@@ -74,26 +78,35 @@ struct Acceptor::State : std::enable_shared_from_this<Acceptor::State>
 
     void stop()
     {
+        if (stopRequested.exchange(true, std::memory_order_acq_rel))
+        {
+            return;
+        }
+        listening.store(false, std::memory_order_release);
         if (loop->isInLoopThread())
         {
             stopInLoop();
             return;
         }
         std::weak_ptr<State> weak = shared_from_this();
-        loop->queueControlInLoop([weak] {
+        if (!loop->queueControlInLoop([weak] {
             if (auto state = weak.lock())
             {
                 state->stopInLoop();
             }
-        });
+        }))
+        {
+            LOG_WARN("Acceptor stop cleanup rejected by stopping EventLoop");
+        }
     }
 
     void stopInLoop()
     {
-        if (!listening.exchange(false, std::memory_order_acq_rel))
+        if (stopped.exchange(true, std::memory_order_acq_rel))
         {
             return;
         }
+        listening.store(false, std::memory_order_release);
         auto operation = std::exchange(acceptOperation, nullptr);
         if (operation)
         {
@@ -219,6 +232,8 @@ struct Acceptor::State : std::enable_shared_from_this<Acceptor::State>
 
     EventLoop *loop;
     Socket listenSocket;
+    std::atomic_bool stopRequested{false};
+    std::atomic_bool stopped{false};
     std::atomic_bool listening{false};
     NewConnectionCallback newConnectionCallback;
     std::shared_ptr<ucp::IoOperation> acceptOperation;

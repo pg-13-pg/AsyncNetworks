@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "Acceptor.hpp"
 #include "EventLoop.hpp"
@@ -27,6 +28,7 @@ class TcpServer
 {
   public:
     using ConnectionCallback = std::function<void(const std::shared_ptr<TcpConnection> &)>; // 回调函数别名
+    using ConnectionDestroyedCallback = std::function<void()>;
 
     TcpServer(EventLoop *loop, const InetAddress &listenAddr, const std::string &name = "TcpServer");
     ~TcpServer();
@@ -54,6 +56,10 @@ class TcpServer
     {
         connectionCallback_ = cb;
     }
+    void setConnectionDestroyedCallback(ConnectionDestroyedCallback cb)
+    {
+        connectionDestroyedCallback_ = std::move(cb);
+    }
 
   private:
     void newConnection(int sockfd, const InetAddress &peerAddr);       // 新连接到来时的回调函数
@@ -64,6 +70,7 @@ class TcpServer
     const std::string ipPort_;              // 服务器监听的地址和端口字符串表示
     std::unique_ptr<Acceptor> acceptor_;    // 负责监听和接受新连接的 Acceptor 对象
     ConnectionCallback connectionCallback_; // 用户设置的新连接业务回调
+    ConnectionDestroyedCallback connectionDestroyedCallback_;
     std::atomic_bool started_;              // 服务器是否已启动
     std::atomic_bool accepting_{false};
     std::atomic_size_t connectionCount_{0};

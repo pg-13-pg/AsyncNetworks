@@ -38,6 +38,9 @@ public:
     void cancel();
 
 private:
+    static DetachedTask monitorDownstreamClose(
+        std::weak_ptr<ProxySession> session,
+        std::shared_ptr<TcpConnection> downstream);
     Task<void> runLoop();
     Task<Result<HttpRequestHead>> readRequestHead();
     Task<Result<HttpResponseHead>> readResponseHead(

@@ -1,6 +1,7 @@
 #include "TcpServer.hpp"
 
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 #include <cassert>
 #include <unistd.h>
@@ -35,10 +36,10 @@ void TcpServer::start()
     accepting_.store(true, std::memory_order_release);
     threadPool_.start(threadInitCallback_);
     // 开始监听
-    auto listen = [this]() { acceptor_->listen(); };
-    if (!loop_->runInLoop(listen))
+    if (!loop_->queueControlInLoop([this] { acceptor_->listen(); }))
     {
-        loop_->queueControlInLoop(std::move(listen));
+        accepting_.store(false, std::memory_order_release);
+        throw std::runtime_error("TcpServer start rejected by stopping EventLoop");
     }
     started_.store(true);
 }
@@ -63,7 +64,10 @@ void TcpServer::stopAccepting()
     auto stop = [this] { acceptor_->stop(); };
     if (!loop_->runInLoop(stop))
     {
-        loop_->queueControlInLoop(std::move(stop));
+        if (!loop_->queueControlInLoop(std::move(stop)))
+        {
+            LOG_WARN("TcpServer stopAccepting cleanup rejected by stopping EventLoop");
+        }
     }
 }
 
@@ -115,7 +119,16 @@ void TcpServer::newConnection(int sockfd, const InetAddress &peerAddr)
     auto establish = std::bind(&TcpConnection::connectEstablished, conn);
     if (!ioLoop->runInLoop(establish))
     {
-        ioLoop->queueControlInLoop(std::move(establish));
+        if (!ioLoop->queueControlInLoop(std::move(establish)))
+        {
+            connections_.erase(connName);
+            connectionCount_.fetch_sub(1, std::memory_order_release);
+            if (connectionDestroyedCallback_)
+            {
+                connectionDestroyedCallback_();
+            }
+            LOG_WARN("TcpServer rejected connection for a stopping worker loop");
+        }
     }
 }
 
@@ -127,12 +140,22 @@ void TcpServer::removeConnection(const std::shared_ptr<TcpConnection> &conn)
             if (connections_.erase(conn->getName()) != 0)
             {
                 connectionCount_.fetch_sub(1, std::memory_order_release);
+                if (connectionDestroyedCallback_)
+                {
+                    connectionDestroyedCallback_();
+                }
             }
         };
         if (!loop_->runInLoop(publishDestroyed))
         {
-            loop_->queueControlInLoop(std::move(publishDestroyed));
+            if (!loop_->queueControlInLoop(std::move(publishDestroyed)))
+            {
+                LOG_ERROR("TcpServer connection publication rejected by stopping base loop");
+            }
         }
     };
-    conn->getLoop()->queueControlInLoop(std::move(destroy));
+    if (!conn->getLoop()->queueControlInLoop(std::move(destroy)))
+    {
+        LOG_ERROR("TcpServer connection destruction rejected by stopping worker loop");
+    }
 }

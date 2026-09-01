@@ -10,12 +10,25 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <poll.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 using namespace std::chrono_literals;
+
+ucp::DetachedTask observePeerClose(
+    const std::shared_ptr<TcpConnection>& connection,
+    std::atomic_bool& waiting,
+    std::atomic_bool& completed)
+{
+    waiting.store(true, std::memory_order_release);
+    auto closed = co_await ucp::asyncWaitPeerClose(connection);
+    CHECK(closed);
+    CHECK((closed.value() & (POLLRDHUP | POLLHUP | POLLERR)) != 0);
+    completed.store(true, std::memory_order_release);
+}
 
 ucp::DetachedTask exerciseSocket(
     const std::shared_ptr<TcpConnection>& connection,
@@ -133,6 +146,20 @@ int main()
     peer.join();
     CHECK_EQ(peerBytes.load(std::memory_order_relaxed), 256U * 1024U);
 
+    std::atomic_bool peerCloseWaiting{false};
+    std::atomic_bool peerCloseCompleted{false};
+    loop->queueControlInLoop([&] {
+        observePeerClose(
+            connection, peerCloseWaiting, peerCloseCompleted);
+    });
+    CHECK(TestSupport::waitUntil(
+        [&] { return peerCloseWaiting.load(std::memory_order_acquire); },
+        2s));
+    CHECK_EQ(::close(sockets[1]), 0);
+    CHECK(TestSupport::waitUntil(
+        [&] { return peerCloseCompleted.load(std::memory_order_acquire); },
+        2s));
+
     std::atomic_bool destroyed{false};
     loop->queueControlInLoop([connection, &destroyed] {
         connection->connectDestroyed();
@@ -141,6 +168,5 @@ int main()
     CHECK(TestSupport::waitUntil(
         [&] { return destroyed.load(std::memory_order_acquire); }, 2s));
     loop->quit();
-    ::close(sockets[1]);
     return 0;
 }

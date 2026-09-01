@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <liburing.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <utility>
 
@@ -217,6 +218,61 @@ IoResult WriteSomeAwaitable::await_resume()
     return operation_->result();
 }
 
+PeerCloseAwaitable::PeerCloseAwaitable(
+    std::shared_ptr<TcpConnection> connection)
+    : connection_(std::move(connection))
+{
+}
+
+bool PeerCloseAwaitable::await_ready() const noexcept
+{
+    return false;
+}
+
+bool PeerCloseAwaitable::await_suspend(
+    std::coroutine_handle<> continuation)
+{
+    if (!connection_ || !connection_->getLoop()
+        || !connection_->checkConnected()) {
+        immediateResult_.emplace(notConnectedResult());
+        return false;
+    }
+
+    EventLoop* loop = connection_->getLoop();
+    const auto operationId = loop->isInLoopThread()
+        ? loop->nextOperationId()
+        : 0;
+    auto operation = std::make_shared<SocketOperation>(
+        operationId, OperationType::poll, false);
+    operation_ = operation;
+    operation->setContinuation(continuation);
+    if (loop->isInLoopThread()) {
+        connection_->trackOperation(operation);
+        tracked_ = true;
+    }
+
+    const auto submitted = loop->submitOperation(
+        operation, 1,
+        [fd = connection_->fd()](
+            std::span<io_uring_sqe*> sqes, IoOperation&) {
+            io_uring_prep_poll_add(
+                sqes[0], fd, POLLRDHUP | POLLHUP | POLLERR);
+        });
+    return submitted.disposition != EventLoop::SubmitDisposition::rejected;
+}
+
+IoResult PeerCloseAwaitable::await_resume()
+{
+    if (tracked_) {
+        connection_->untrackOperation(operation_->id());
+        tracked_ = false;
+    }
+    if (immediateResult_) {
+        return std::move(*immediateResult_);
+    }
+    return operation_->result();
+}
+
 ReadSomeAwaitable asyncReadSome(
     std::shared_ptr<TcpConnection> connection,
     std::span<std::byte> buffer,
@@ -233,6 +289,12 @@ WriteSomeAwaitable asyncWriteSome(
 {
     return WriteSomeAwaitable(
         std::move(connection), buffer, deadline);
+}
+
+PeerCloseAwaitable asyncWaitPeerClose(
+    std::shared_ptr<TcpConnection> connection)
+{
+    return PeerCloseAwaitable(std::move(connection));
 }
 
 Task<IoResult> asyncWriteAll(
