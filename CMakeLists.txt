@@ -106,6 +106,9 @@ target_link_libraries(recommend_client pthread)
 add_executable(ucp_gateway gateway/ucp_gateway.cpp)
 target_link_libraries(ucp_gateway proactor_static ${LIBURING_LIBRARIES} ${FMT_LIBRARIES} pthread)
 
+add_executable(gateway_mock_upstream bench/mock_upstream.cpp)
+target_link_libraries(gateway_mock_upstream proactor_static ${LIBURING_LIBRARIES} ${FMT_LIBRARIES} pthread)
+
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
