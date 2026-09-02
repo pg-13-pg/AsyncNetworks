@@ -1,6 +1,6 @@
 # ThreadSanitizer Verification Notes
 
-Date: 2026-09-01
+Date: 2026-09-02
 
 ## Environment
 
@@ -22,11 +22,13 @@ ctest --test-dir build-gateway-tsan --output-on-failure
 
 Configuration and compilation completed successfully. TSan results on this
 WSL2 host are nondeterministic because many processes fail while reserving the
-TSan shadow address space. The final full run completed 2 of 12 tests without
-a TSan report (`ucp_result_test` and `ucp_async_socket_test`). The other 10
-processes failed during TSan startup with `unexpected memory mapping` or a
-startup segmentation fault; none of those failures produced an application
-race report.
+TSan shadow address space. The final handoff run completed 2 of 12 tests
+without a TSan report (`ucp_io_operation_test` and
+`ucp_event_loop_operation_test`). Of the other 10 tests, eight failed directly
+with `unexpected memory mapping`, `ucp_proxy_session_test` had a startup
+segmentation fault, and the shutdown test's signal-path child failed shadow
+memory initialization so its parent assertion failed. None produced an
+application race report.
 
 Representative output from the smallest test was:
 
