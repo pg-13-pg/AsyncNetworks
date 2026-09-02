@@ -6,6 +6,7 @@
 #include "Buffer.hpp"
 #include "TcpConnection.hpp"
 
+// 根据背压状态注册完成回调，并向 io_uring 提交异步写请求。
 void AsyncWriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept
 {
     auto &ctx = conn_->getWriteContext();
