@@ -31,9 +31,9 @@ EventLoop::Options normalizeOptions(EventLoop::Options options)
     {
         options.pendingQueueCapacity = 1024;
     }
-    if (options.registeredBuffersCount == 0)
+    if (options.pendingSubmissionCapacity == 0)
     {
-        options.registeredBuffersCount = 1;
+        options.pendingSubmissionCapacity = 1024;
     }
     if (options.registeredBuffersSize == 0)
     {
@@ -60,7 +60,8 @@ EventLoop::EventLoop() : EventLoop(Options())
 EventLoop::EventLoop(const Options &options)
     : options_(normalizeOptions(options)), running_(false), quit_(false), threadId_(::gettid()),
       wakeupFd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)), wakeupContext_(IoType::Read, wakeupFd_),
-      callingPendingFunctors_(false), pendingFunctors_{options_.pendingQueueCapacity}
+      pendingFunctors_{std::max<std::size_t>(2, options_.pendingQueueCapacity)},
+      callingPendingFunctors_(false)
 {
     if (wakeupFd_ < 0)
     {
@@ -96,13 +97,24 @@ EventLoop::EventLoop(const Options &options)
 
 EventLoop::~EventLoop()
 {
-    if (!registeredIovecs.empty())
+    releaseResources();
+}
+
+void EventLoop::releaseResources()
+{
+    if (resourcesReleased_)
+    {
+        return;
+    }
+
+    if (registeredBuffersActive_)
     {
         int ret = io_uring_unregister_buffers(&ring_); // 注销注册缓冲区
         if (ret < 0)
         {
             LOG_ERROR("io_uring_unregister_buffers failed: {}", ret);
         }
+        registeredBuffersActive_ = false;
     }
 
     for (void *ptr : registeredBuffersPool) // 释放缓冲区
@@ -113,22 +125,51 @@ EventLoop::~EventLoop()
     registeredIovecs.clear();
     freeBufferIndices_.clear();
 
-    ::close(wakeupFd_);          // 关闭 eventfd 文件描述符
+    if (wakeupFd_ >= 0)
+    {
+        ::close(wakeupFd_);      // 关闭 eventfd 文件描述符
+        wakeupFd_ = -1;
+    }
     io_uring_queue_exit(&ring_); // 释放 io_uring 资源
+    resourcesReleased_ = true;
 }
 
 void EventLoop::loop()
 {
-    running_ = true;
-    quit_ = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(lifecycleMutex_);
+        if (lifecycleState_ == LifecycleState::stopped)
+        {
+            return;
+        }
+        if (lifecycleState_ == LifecycleState::initialized)
+        {
+            lifecycleState_ = LifecycleState::running;
+        }
+        running_ = lifecycleState_ == LifecycleState::running;
+    }
 
     while (!quit_)
     {
+        doControlFunctors();
+        doPendingFunctors();
+        flushPendingSubmissions();
+
+        if (quit_.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
         // 仅在有待提交 SQE 时提交，减少无效系统调用
         // 必须在等待io_uring_wait_cqe()之前提交，否则内核不知道有新请求，可能死锁
         if (io_uring_sq_ready(&ring_) > 0) // 返回当前 SQ 队列中待提交的请求数量
         {
-            io_uring_submit(&ring_); // 提交，更新尾指针，以便内核看到新请求
+            const int submitted = io_uring_submit(&ring_); // 提交，更新尾指针，以便内核看到新请求
+            if (submitted < 0)
+            {
+                LOG_ERROR("io_uring_submit error: {}", submitted);
+                break;
+            }
         }
 
         struct io_uring_cqe *cqe;
@@ -157,107 +198,539 @@ void EventLoop::loop()
         // 推进 CQ 队列
         io_uring_cq_advance(&ring_, count);
 
-        // 执行任务队列中的任务，
-        doPendingFunctors();
     }
 
-    running_ = false;
+    // Explicit quit and fatal ring errors share the same ingress boundary.
+    // Every callback accepted before it is stable and can now be drained.
+    beginStopping(false);
+    doControlFunctors();
+    while (pendingFunctorCount_.load(std::memory_order_acquire) != 0)
+    {
+        doPendingFunctors();
+    }
+    drainOperationsForShutdown();
+
+    {
+        std::unique_lock<std::shared_mutex> lock(lifecycleMutex_);
+        lifecycleState_ = LifecycleState::stopped;
+        running_.store(false, std::memory_order_release);
+    }
+    releaseResources();
 }
 
 // 可由其他的线程调用，通知EventLoop退出循环
 void EventLoop::quit()
 {
-    quit_ = true;
-    if (::gettid() != threadId_)
+    beginStopping(::gettid() != threadId_);
+}
+
+void EventLoop::beginStopping(bool wakeLoop)
+{
+    stoppingRequested_.store(true, std::memory_order_release);
+    std::unique_lock<std::shared_mutex> lock(lifecycleMutex_);
+    if (lifecycleState_ == LifecycleState::stopping
+        || lifecycleState_ == LifecycleState::stopped)
+    {
+        return;
+    }
+
+    lifecycleState_ = LifecycleState::stopping;
+    quit_.store(true, std::memory_order_release);
+    if (wakeLoop)
     {
         wakeup(); // 唤醒阻塞io_uring_wait_cqe(&ring_, &cqe)的事件循环线程，让其退出循环
     }
 }
 
 // 确保回调函数最终在这个 EventLoop 所属的线程中执行。
-void EventLoop::runInLoop(Functor cb)
+bool EventLoop::runInLoop(Functor cb)
 {
-    if (::gettid() == threadId_)
+    if (isInLoopThread())
     {
+        if (stoppingRequested_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
         cb();
+        return true;
     }
-    else
-    {
-        queueInLoop(std::move(cb)); // 移动，减少拷贝开销
-    }
+    return queueInLoop(std::move(cb));
 }
 
 // 将任务放入跨线程任务队列（pendingFunctors_）中，必要时唤醒目标 EventLoop 线程执行
 // 包含队列级别的背压机制：防止主线程分发任务过快，导致工作线程队列积压 OOM
-void EventLoop::queueInLoop(Functor cb)
+bool EventLoop::queueInLoop(Functor cb)
 {
-    // 获取当前队列大小（无锁队列的 size() 是近似值，因为无锁多线程同时操作，size（）不准确，但用于背压判断足够了）
-    size_t curQueueSize = pendingFunctors_.size();
+    if (stoppingRequested_.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (stoppingRequested_.load(std::memory_order_acquire)
+        || lifecycleState_ == LifecycleState::stopping
+        || lifecycleState_ == LifecycleState::stopped)
+    {
+        return false;
+    }
+
+    size_t curQueueSize = pendingFunctorCount_.load(std::memory_order_relaxed);
+    while (true)
+    {
+        if (curQueueSize >= options_.pendingQueueCapacity)
+        {
+            if (options_.enableQueueFullStats)
+            {
+                const auto dropped = queueFullCount_.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                LOG_ERROR("EventLoop: pending queue full! queueSize={}, capacity={}, droppedCount={}", curQueueSize,
+                          options_.pendingQueueCapacity, dropped);
+            }
+            return false;
+        }
+        if (pendingFunctorCount_.compare_exchange_weak(
+                curQueueSize, curQueueSize + 1,
+                std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
 
     // 尝试入队，如果队列已满（达到 capacity），则丢弃任务并告警
     if (!pendingFunctors_.enqueue(std::move(cb)))
     {
+        pendingFunctorCount_.fetch_sub(1, std::memory_order_release);
         // 队列满了，统计队列已满的次数
         if (options_.enableQueueFullStats)
         {
-            backpressureStats_.queueFullCount++;
+            const auto dropped = queueFullCount_.fetch_add(
+                1, std::memory_order_relaxed) + 1;
             LOG_ERROR("EventLoop: pending queue full! queueSize={}, capacity={}, droppedCount={}", curQueueSize,
-                      options_.pendingQueueCapacity, backpressureStats_.queueFullCount);
+                      options_.pendingQueueCapacity, dropped);
         }
-        return;
+        return false;
     }
 
     // 统计：记录队列达到的最大长度峰值，便于后续调优
-    backpressureStats_.maxPendingQueueSize = std::max(backpressureStats_.maxPendingQueueSize, curQueueSize);
+    const size_t observedSize = curQueueSize + 1;
+    size_t recordedMax = maxPendingQueueSize_.load(std::memory_order_relaxed);
+    while (recordedMax < observedSize
+           && !maxPendingQueueSize_.compare_exchange_weak(
+               recordedMax, observedSize, std::memory_order_relaxed))
+    {
+    }
 
     // 检查是否触发高水位阈值，wasInHighWaterMark 是上一次的状态，isHighWaterMark 是当前状态
     bool isHighWaterMark = curQueueSize >= options_.pendingQueueHighWaterMark;
     bool wasInHighWaterMark = inHighWaterMark_.load(std::memory_order_relaxed);
 
+    bool notifyHighWater = false;
+    bool notifyLowWater = false;
     if (isHighWaterMark && !wasInHighWaterMark)
     {
         // 状态跃迁：从正常状态进入高水位状态
         inHighWaterMark_.store(true, std::memory_order_relaxed);
-        backpressureStats_.highWaterMarkEvents++;
+        highWaterMarkEvents_.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("EventLoop: entering high water mark, queueSize={}, threshold={}", curQueueSize,
                  options_.pendingQueueHighWaterMark);
-        // 触发高水位回调，业务层可在此回调中暂停接收新连接或降低任务生产速率，todo:
-        if (backpressureCallback_)
-        {
-            backpressureCallback_(true);
-        }
+        notifyHighWater = true;
     }
     else if (!isHighWaterMark && wasInHighWaterMark && curQueueSize <= options_.pendingQueueLowWaterMark)
     {
         // 状态跃迁：从高水位状态恢复到正常状态（必须降至低水位以下才算恢复，防止在阈值附近频繁震荡，双阈值限定）
         inHighWaterMark_.store(false, std::memory_order_relaxed);
-        backpressureStats_.lowWaterMarkEvents++;
+        lowWaterMarkEvents_.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("EventLoop: leaving high water mark, queueSize={}, threshold={}", curQueueSize,
                  options_.pendingQueueLowWaterMark);
-        // 触发低水位回调，业务层可在此回调中恢复接收新连接或恢复任务生产
-        if (backpressureCallback_)
-        {
-            backpressureCallback_(false);
-        }
+        notifyLowWater = true;
     }
 
     // 如果其他线程投递任务 或者当前线程正在执行 pendingFunctors，都需要唤醒
     // doPendingFunctors() 之后会循环到 io_uring_wait_cqe()，如果不唤醒，可能会阻塞等待，导致任务延迟执行
-    if (::gettid() != threadId_ || callingPendingFunctors_)
+    if (!isInLoopThread() || callingPendingFunctors_)
     {
         wakeup();
+    }
+    lifecycleLock.unlock();
+
+    // User callbacks may request shutdown, so they must run outside the
+    // shared lifecycle boundary.
+    if (notifyHighWater && backpressureCallback_)
+    {
+        backpressureCallback_(true);
+    }
+    else if (notifyLowWater && backpressureCallback_)
+    {
+        backpressureCallback_(false);
+    }
+    return true;
+}
+
+bool EventLoop::queueControlInLoop(Functor cb)
+{
+    if (stoppingRequested_.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> lifecycleLock(lifecycleMutex_);
+    if (stoppingRequested_.load(std::memory_order_acquire)
+        || lifecycleState_ == LifecycleState::stopping
+        || lifecycleState_ == LifecycleState::stopped)
+    {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        controlFunctors_.push_back(std::move(cb));
+    }
+    if (!isInLoopThread() || running_.load(std::memory_order_acquire))
+    {
+        wakeup();
+    }
+    return true;
+}
+
+bool EventLoop::isInLoopThread() const noexcept
+{
+    return ::gettid() == threadId_;
+}
+
+std::uint64_t EventLoop::nextOperationId() noexcept
+{
+    return nextOperationId_++;
+}
+
+EventLoop::SubmitResult EventLoop::submitOperation(
+    std::shared_ptr<ucp::IoOperation> operation,
+    std::size_t sqeCount,
+    OperationPreparer prepare)
+{
+    if (!isInLoopThread())
+    {
+        ucp::Error error{
+            ucp::ErrorCode::system, EPERM,
+            "operation submission must run on the owning EventLoop"};
+        if (operation)
+        {
+            operation->reject(error);
+        }
+        return {SubmitDisposition::rejected, std::move(error)};
+    }
+    if (!operation || sqeCount == 0 || !prepare)
+    {
+        ucp::Error error{
+            ucp::ErrorCode::system, EINVAL, "invalid operation submission"};
+        if (operation)
+        {
+            operation->reject(error);
+        }
+        return {SubmitDisposition::rejected, std::move(error)};
+    }
+    if (stoppingRequested_.load(std::memory_order_acquire))
+    {
+        ucp::Error error{
+            ucp::ErrorCode::cancelled, ECANCELED,
+            "event loop is stopping"};
+        operation->reject(error);
+        return {SubmitDisposition::rejected, std::move(error)};
+    }
+    if (inFlightOperations_.find(operation->id()) != inFlightOperations_.end())
+    {
+        ucp::Error error{
+            ucp::ErrorCode::system, EALREADY, "operation id is already in flight"};
+        operation->reject(error);
+        return {SubmitDisposition::rejected, std::move(error)};
+    }
+
+    if (io_uring_sq_space_left(&ring_) >= sqeCount)
+    {
+        prepareSubmission(operation, sqeCount, prepare);
+        return {SubmitDisposition::submitted, {}};
+    }
+    if (pendingSubmissions_.size() < options_.pendingSubmissionCapacity)
+    {
+        pendingSubmissions_.push_back(
+            {std::move(operation), sqeCount, std::move(prepare)});
+        return {SubmitDisposition::queued, {}};
+    }
+
+    ucp::Error error{
+        ucp::ErrorCode::resourceExhausted, EAGAIN,
+        "pending submission queue full"};
+    operation->reject(error);
+    return {SubmitDisposition::rejected, std::move(error)};
+}
+
+bool EventLoop::cancelOperation(
+    const std::shared_ptr<ucp::IoOperation> &operation)
+{
+    if (!operation || !isInLoopThread())
+    {
+        return false;
+    }
+
+    const auto pendingIt = std::find_if(
+        pendingSubmissions_.begin(), pendingSubmissions_.end(),
+        [&](const PendingSubmission &pending) {
+            return pending.operation == operation;
+        });
+    if (pendingIt != pendingSubmissions_.end())
+    {
+        if (!operation->requestCancel())
+        {
+            return false;
+        }
+        pendingSubmissions_.erase(pendingIt);
+        finishRejectedOperation(
+            operation,
+            {ucp::ErrorCode::cancelled, ECANCELED, "operation cancelled"});
+        return true;
+    }
+
+    if (inFlightOperations_.find(operation->id()) == inFlightOperations_.end()
+        || !operation->requestCancel())
+    {
+        return false;
+    }
+    if (!submitCancel(operation))
+    {
+        queueControlInLoop(
+            [this, operation] { retryCancel(operation); });
+    }
+    return true;
+}
+
+std::size_t EventLoop::inFlightOperationCount() const noexcept
+{
+    return inFlightOperationCount_.load(std::memory_order_acquire);
+}
+
+bool EventLoop::prepareSubmission(
+    const std::shared_ptr<ucp::IoOperation> &operation,
+    std::size_t sqeCount,
+    const OperationPreparer &prepare)
+{
+    if (io_uring_sq_space_left(&ring_) < sqeCount)
+    {
+        return false;
+    }
+
+    std::vector<io_uring_sqe *> sqes;
+    sqes.reserve(sqeCount);
+    for (std::size_t i = 0; i < sqeCount; ++i)
+    {
+        io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+        if (!sqe)
+        {
+            std::abort();
+        }
+        sqes.push_back(sqe);
+    }
+
+    prepare(std::span<io_uring_sqe *>(sqes), *operation);
+    io_uring_sqe_set_data(sqes[0], &operation->ioToken());
+    if (sqeCount > 1)
+    {
+        io_uring_sqe_set_data(sqes[1], &operation->timeoutToken());
+    }
+    for (std::size_t i = 2; i < sqeCount; ++i)
+    {
+        io_uring_sqe_set_data(sqes[i], &operation->ioToken());
+    }
+
+    operation->arm(static_cast<unsigned>(sqeCount));
+    inFlightOperations_.emplace(operation->id(), operation);
+    inFlightOperationCount_.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+void EventLoop::finishRejectedOperation(
+    const std::shared_ptr<ucp::IoOperation> &operation,
+    ucp::Error error)
+{
+    operation->reject(std::move(error));
+    auto continuation = operation->takeContinuation();
+    auto callback = operation->takeCompletionCallback();
+    if (continuation)
+    {
+        continuation.resume();
+    }
+    else if (callback)
+    {
+        callback(operation->result());
+    }
+}
+
+bool EventLoop::submitCancel(
+    const std::shared_ptr<ucp::IoOperation> &operation)
+{
+    if (io_uring_sq_space_left(&ring_) == 0)
+    {
+        return false;
+    }
+    io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+    if (!sqe)
+    {
+        return false;
+    }
+    io_uring_prep_cancel(sqe, &operation->ioToken(), 0);
+    io_uring_sqe_set_data(sqe, &operation->cancelToken());
+    operation->addExpectedCqe();
+    return true;
+}
+
+void EventLoop::retryCancel(
+    const std::shared_ptr<ucp::IoOperation> &operation)
+{
+    if (inFlightOperations_.find(operation->id())
+        == inFlightOperations_.end())
+    {
+        return;
+    }
+    if (!submitCancel(operation))
+    {
+        queueControlInLoop(
+            [this, operation] { retryCancel(operation); });
+    }
+}
+
+void EventLoop::drainOperationsForShutdown()
+{
+    while (!pendingSubmissions_.empty())
+    {
+        auto pending = std::move(pendingSubmissions_.front());
+        pendingSubmissions_.pop_front();
+        finishRejectedOperation(
+            pending.operation,
+            {ucp::ErrorCode::cancelled, ECANCELED,
+             "event loop stopped before operation submission"});
+    }
+
+    std::vector<std::shared_ptr<ucp::IoOperation>> cancellations;
+    cancellations.reserve(inFlightOperations_.size());
+    for (const auto &[id, operation] : inFlightOperations_)
+    {
+        (void)id;
+        operation->requestCancel();
+        cancellations.push_back(operation);
+    }
+
+    std::size_t nextCancellation = 0;
+    while (!inFlightOperations_.empty())
+    {
+        while (nextCancellation < cancellations.size())
+        {
+            const auto &operation = cancellations[nextCancellation];
+            if (inFlightOperations_.find(operation->id())
+                == inFlightOperations_.end())
+            {
+                ++nextCancellation;
+                continue;
+            }
+            if (!submitCancel(operation))
+            {
+                break;
+            }
+            ++nextCancellation;
+        }
+
+        if (io_uring_sq_ready(&ring_) > 0)
+        {
+            const int submitted = io_uring_submit(&ring_);
+            if (submitted < 0)
+            {
+                LOG_ERROR("EventLoop shutdown submit failed: {}", submitted);
+                std::abort();
+            }
+        }
+
+        io_uring_cqe *cqe = nullptr;
+        const int result = io_uring_wait_cqe(&ring_, &cqe);
+        if (result == -EINTR)
+        {
+            continue;
+        }
+        if (result < 0)
+        {
+            LOG_ERROR("EventLoop shutdown CQE wait failed: {}", result);
+            std::abort();
+        }
+
+        unsigned head;
+        unsigned count = 0;
+        io_uring_for_each_cqe(&ring_, head, cqe)
+        {
+            ++count;
+            handleCompletionEvent(cqe);
+        }
+        io_uring_cq_advance(&ring_, count);
     }
 }
 
 //
 void EventLoop::handleCompletionEvent(io_uring_cqe *cqe)
 {
-    void *data = io_uring_cqe_get_data(cqe); // IOContext*，通过io_uring_sqe_set_data()设置的指针
-    if (!data)                               // 安全检查
+    void *data = io_uring_cqe_get_data(cqe);
+    if (!data)
     {
         return;
     }
-    IoContext *ctx = static_cast<IoContext *>(data);
+
+    auto *completionData = static_cast<ucp::CompletionData *>(data);
+    if (completionData->magic != ucp::CompletionData::magicValue)
+    {
+        LOG_ERROR("EventLoop: invalid CQE user data tag");
+        return;
+    }
+
+    if (completionData->kind == ucp::CompletionDataKind::operationToken)
+    {
+        auto *token = static_cast<ucp::CompletionToken *>(completionData);
+        if (!token->operation)
+        {
+            LOG_ERROR("EventLoop: operation CQE has no owner");
+            return;
+        }
+
+        const auto operationIt = inFlightOperations_.find(
+            token->operation->id());
+        if (operationIt == inFlightOperations_.end())
+        {
+            LOG_ERROR("EventLoop: CQE references unknown operation {}",
+                      token->operation->id());
+            return;
+        }
+
+        auto operation = operationIt->second;
+        const auto decision = operation->onCompletion(
+            token->completionKind, cqe->res);
+
+        std::coroutine_handle<> continuation;
+        std::function<void(const ucp::IoResult &)> callback;
+        if (decision.resume)
+        {
+            continuation = operation->takeContinuation();
+            callback = operation->takeCompletionCallback();
+        }
+
+        if (decision.drained)
+        {
+            inFlightOperations_.erase(operationIt);
+            inFlightOperationCount_.fetch_sub(1, std::memory_order_release);
+        }
+
+        if (continuation)
+        {
+            continuation.resume();
+        }
+        else if (callback)
+        {
+            callback(operation->result());
+        }
+        return;
+    }
+
+    IoContext *ctx = static_cast<IoContext *>(completionData);
 
     // Cancel CQE 安全检查：如果 IoContext 绑定了 TcpConnection，检查连接是否还活着
     // 只有 TcpConnection 的读写 IO 才绑定了 connection（Acceptor/Wakeup 的 connection 为空）
@@ -302,11 +775,41 @@ void EventLoop::wakeup()
 
 // 这个函数为当前 EventLoop 创建一组固定网络缓冲区，并将它们一次性注册到该 EventLoop 的 io_uring。
 // 之后 TcpConnection 可以从缓冲池借一块缓冲区，用于 read_fixed 等固定缓冲区 I /O。
-void EventLoop::initRegisteredBuffers()
+bool EventLoop::initRegisteredBuffers()
 {
-    registeredBuffersPool.resize(options_.registeredBuffersCount);
-    registeredIovecs.resize(options_.registeredBuffersCount);
-    freeBufferIndices_.reserve(options_.registeredBuffersCount);
+    if (registeredBuffersInitialized_)
+    {
+        return options_.registeredBuffersCount == 0 || registeredBuffersActive_;
+    }
+    registeredBuffersInitialized_ = true;
+
+    if (options_.registeredBuffersCount == 0)
+    {
+        return true;
+    }
+
+    const auto cleanup = [this]() {
+        for (void *ptr : registeredBuffersPool)
+        {
+            std::free(ptr);
+        }
+        registeredBuffersPool.clear();
+        registeredIovecs.clear();
+        freeBufferIndices_.clear();
+    };
+
+    try
+    {
+        registeredBuffersPool.resize(options_.registeredBuffersCount);
+        registeredIovecs.resize(options_.registeredBuffersCount);
+        freeBufferIndices_.reserve(options_.registeredBuffersCount);
+    }
+    catch (const std::bad_alloc &)
+    {
+        cleanup();
+        LOG_ERROR("initRegisteredBuffers: metadata allocation failed");
+        return false;
+    }
 
     // 页对齐分配
     for (size_t i = 0; i < options_.registeredBuffersCount; ++i)
@@ -315,7 +818,8 @@ void EventLoop::initRegisteredBuffers()
         if (posix_memalign(&ptr, 4096, options_.registeredBuffersSize) != 0) // 4KB
         {
             LOG_ERROR("initRegisteredBuffers: posix_memalign failed");
-            throw std::bad_alloc();
+            cleanup();
+            return false;
         }
         registeredBuffersPool[i] = ptr;
         registeredIovecs[i].iov_base = ptr;
@@ -328,7 +832,11 @@ void EventLoop::initRegisteredBuffers()
     if (ret < 0)
     {
         LOG_ERROR("io_uring_register_buffers failed: {}", ret);
+        cleanup();
+        return false;
     }
+    registeredBuffersActive_ = true;
+    return true;
 }
 
 int EventLoop::getRegisteredBufferIndex()
@@ -377,6 +885,35 @@ void EventLoop::asyncReadWakeup()
     // io_uring_submit(&ring_); // 移除通过 Loop 统一提交
 }
 
+void EventLoop::doControlFunctors()
+{
+    std::deque<Functor> functors;
+    {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        functors.swap(controlFunctors_);
+    }
+    for (auto &functor : functors)
+    {
+        functor();
+    }
+}
+
+void EventLoop::flushPendingSubmissions()
+{
+    while (!pendingSubmissions_.empty())
+    {
+        const auto &pending = pendingSubmissions_.front();
+        if (io_uring_sq_space_left(&ring_) < pending.sqeCount)
+        {
+            break;
+        }
+
+        PendingSubmission ready = std::move(pendingSubmissions_.front());
+        pendingSubmissions_.pop_front();
+        prepareSubmission(ready.operation, ready.sqeCount, ready.prepare);
+    }
+}
+
 // 取出任务对列中的任务保存到本地，执行任务队列中的任务，通常是建立新连接，在取出任务时，生产者可以继续入队，避免阻塞生产者线程
 void EventLoop::doPendingFunctors()
 {
@@ -393,6 +930,7 @@ void EventLoop::doPendingFunctors()
     int limit = 65536;
     while (limit-- > 0 && pendingFunctors_.dequeue(f))
     {
+        pendingFunctorCount_.fetch_sub(1, std::memory_order_release);
         functors.emplace_back(std::move(f));
     }
 
@@ -407,10 +945,17 @@ void EventLoop::doPendingFunctors()
 
 EventLoop::BackpressureStats EventLoop::getBackpressureStats() const
 {
-    return backpressureStats_;
+    return {
+        maxPendingQueueSize_.load(std::memory_order_relaxed),
+        queueFullCount_.load(std::memory_order_relaxed),
+        highWaterMarkEvents_.load(std::memory_order_relaxed),
+        lowWaterMarkEvents_.load(std::memory_order_relaxed)};
 }
 
 void EventLoop::resetBackpressureStats()
 {
-    backpressureStats_ = BackpressureStats();
+    maxPendingQueueSize_.store(0, std::memory_order_relaxed);
+    queueFullCount_.store(0, std::memory_order_relaxed);
+    highWaterMarkEvents_.store(0, std::memory_order_relaxed);
+    lowWaterMarkEvents_.store(0, std::memory_order_relaxed);
 }

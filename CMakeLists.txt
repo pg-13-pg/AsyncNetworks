@@ -1,6 +1,9 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 # 设置项目名称
 project(io_uring_test)
+include(cmake/Sanitizers.cmake)
+
+include(CTest)
 
  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -37,18 +40,18 @@ include_directories(${CMAKE_SOURCE_DIR}/include/codec)
 include_directories(${CMAKE_SOURCE_DIR}/recommend)
 
 # 设置可执行文件输出目录
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # 设置动态库输出目录
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # 设置静态库输出目录
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # ==========================================
 # 项目构建配置
 # ==========================================
 
 # 1. 收集源文件 (排除入口文件)
-file(GLOB SRC_FILES "src/*.cpp")
+file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS "src/*.cpp" "src/ucp/*.cpp")
 file(GLOB MEMORY_FILES "memory/*.cpp")
 file(GLOB LOG_FILES "log/*.cpp")
 file(GLOB CODEC_FILES "codec/*.cpp")
@@ -83,8 +86,6 @@ target_link_libraries(echo_bench pthread)
 # 6. 客户端测试工具
 add_executable(test_client client/test_client.cpp)
 target_link_libraries(test_client pthread)
-# 将 test_client 的输出目录单独设置为 client 目录
-set_target_properties(test_client PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/client)
 
 # ==========================================
 # 推荐服务项目构建
@@ -100,6 +101,14 @@ set_target_properties(recommend_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMA
 # 8. 推荐服务测试客户端（用于性能测试和功能验证）
 add_executable(recommend_client recommend/recommend_client.cpp)
 target_link_libraries(recommend_client pthread)
-# 设置输出目录为 recommend/
-set_target_properties(recommend_client PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/recommend)
 
+# 9. Runnable reverse-proxy gateway
+add_executable(ucp_gateway gateway/ucp_gateway.cpp)
+target_link_libraries(ucp_gateway proactor_static ${LIBURING_LIBRARIES} ${FMT_LIBRARIES} pthread)
+
+add_executable(gateway_mock_upstream bench/mock_upstream.cpp)
+target_link_libraries(gateway_mock_upstream proactor_static ${LIBURING_LIBRARIES} ${FMT_LIBRARIES} pthread)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

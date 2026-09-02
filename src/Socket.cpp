@@ -10,6 +10,23 @@
 #include "Logger.hpp"
 #include "Socket.hpp"
 
+namespace
+{
+bool setSocketOption(int fd, int level, int option, bool on, const char *name)
+{
+    const int value = on ? 1 : 0;
+    if (::setsockopt(fd, level, option, &value, sizeof(value)) == 0)
+    {
+        return true;
+    }
+
+    const int errorNumber = errno;
+    LOG_ERROR("{} failed: {} (errno={})", name, std::strerror(errorNumber), errorNumber);
+    errno = errorNumber;
+    return false;
+}
+} // namespace
+
 Socket::~Socket()
 {
     // 在这里真正的关闭连接socket或关闭监听socket并释放资源，TcpConnection中的断开连接只是逻辑上的断开
@@ -93,28 +110,24 @@ InetAddress Socket::getPeerAddress() const
     return InetAddress(peeraddr);
 }
 
-void Socket::setTcpNoDelay(bool on)
+bool Socket::setTcpNoDelay(bool on)
 {
-    int optval = on ? 1 : 0;
-    ::setsockopt(sockfd_, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
+    return setSocketOption(sockfd_, IPPROTO_TCP, TCP_NODELAY, on, "Socket::setTcpNoDelay");
 }
 
-void Socket::setReuseAddr(bool on)
+bool Socket::setReuseAddr(bool on)
 {
-    int optval = on ? 1 : 0;
-    ::setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    return setSocketOption(sockfd_, SOL_SOCKET, SO_REUSEADDR, on, "Socket::setReuseAddr");
 }
 
-void Socket::setReusePort(bool on)
+bool Socket::setReusePort(bool on)
 {
-    int optval = on ? 1 : 0;
-    ::setsockopt(sockfd_, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    return setSocketOption(sockfd_, SOL_SOCKET, SO_REUSEPORT, on, "Socket::setReusePort");
 }
 
-void Socket::setKeepAlive(bool on)
+bool Socket::setKeepAlive(bool on)
 {
-    int optval = on ? 1 : 0;
-    ::setsockopt(sockfd_, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+    return setSocketOption(sockfd_, SOL_SOCKET, SO_KEEPALIVE, on, "Socket::setKeepAlive");
 }
 
 void Socket::closeFd()

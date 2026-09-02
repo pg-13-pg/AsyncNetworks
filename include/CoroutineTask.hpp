@@ -17,10 +17,10 @@ struct Task
         {
             return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
-        std::suspend_never initial_suspend()
+        std::suspend_never initial_suspend() // 协程创建后立即执行， std::suspend_always 表示协程创建后立即挂起，
         {
             return {};
-        } // 协程创建后立即执行， std::suspend_always 表示协程创建后立即挂起，
+        }
         std::suspend_never final_suspend() noexcept
         {
             return {};

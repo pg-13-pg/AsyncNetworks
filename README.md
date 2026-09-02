@@ -1,365 +1,182 @@
-<h1 align="center">UCP (uring_coroutine_proactor)</h1>
+# UCP Proxy Core
 
-<p align="center">
-  <b>基于 io_uring 与 C++20 协程的极致高性能纯异步网络框架</b>
-</p>
+UCP 是一个面向学习与秋招展示的 Linux 高并发网络项目。当前主线交付物不是完整
+API 网关，而是一个建立在 `io_uring`、C++20 协程和多 EventLoop 之上的
+HTTP/1.1 反向代理数据面核心。项目重点是可解释的 I/O 生命周期、连接归属、流式
+背压、上游连接复用、错误传播和可复现验证，而不是鉴权、管理后台等外围功能。
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Linux-blue.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/C++-20-blue.svg" alt="C++20">
-  <img src="https://img.shields.io/badge/io__uring-5.10+-brightgreen.svg" alt="io_uring">
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
-</p>
+仓库中原有的 TCP 示例和 legacy I/O API 仍可构建；代理使用 `include/ucp` 下的
+类型化安全路径。
 
-## 📖 项目简介
-该系统是一个专为 Linux 环境设计的高性能 TCP 服务器框架。它摒弃了传统的 `epoll + Reactor` 模型，全面拥抱 Linux **io_uring** 异步 I/O 接口，实现了纯粹的 **Proactor** 模式。
+## 核心能力
 
-本项目的核心目标是**极致的性能与低延迟**。通过“内核执行 I/O，完成后通知应用”的机制，结合 C++20 无栈协程、无锁任务队列、零拷贝等现代前沿技术，最大化利用多核 CPU 资源。适用于海量并发连接的高频交易、即时通讯及高性能网关等场景。
+- 每个已接受的 I/O 由 `IoOperation` 独立描述，并由所属 `EventLoop` 持有到所有
+  相关 CQE 排空；超时、取消和 I/O 完成竞态只对外完成一次。
+- 每个 worker 持有独立的 `io_uring`、路由选择器、指标分片和上游连接池。
+  下游连接、`ProxySession` 与上游连接固定在同一 worker，不跨线程共享热路径状态。
+- `asyncReadSome`、`asyncWriteSome`、`asyncWriteAll` 和 `asyncConnect` 返回类型化
+  结果，显式区分 EOF、超时、取消、连接重置和资源耗尽。
+- 请求与响应正文按固定大小分块转发。当前块写完后才读取下一块，将慢消费者的
+  压力传回生产端，限制单会话内存增长。
+- 静态路由采用最长前缀匹配，上游选择为 worker-local round robin；连接池通过
+  move-only RAII lease 决定复用或丢弃连接。
+- 普通跨线程任务队列有容量限制，生命周期控制有独立入口；关闭时按停止接收、
+  会话 drain、取消未完成 I/O、消费 CQE、释放 ring 资源的顺序执行。
 
-## ✨ 核心特性与优化设计
-- **🚀 内核级轮询 (Zero Syscall)**: 配置 `IORING_SETUP_SQPOLL` 开启内核轮询线程。应用投递任务仅需更新队列尾指针，极大概率免除 `io_uring_enter` 系统调用开销，实现原生极低延迟。
-- **⚡ 减少内存映射开销 (Fixed Buffers)**: 深度利用 io_uring 的 **Registered Buffers** 特性预先固定内存映射。避免高并发 I/O 时内核频繁执行 `get_user_pages`/`put_page` 开销，大幅提升极速读写性能。
-- **🧵 C++20 无栈协程解耦**: 利用 C++20 协程定制 `promise_type` 与 `awaiter`，将异步 SQE 提交与 CQE 收割无缝桥接至协程的挂起与恢复，用同步代码思路编写异步流，彻底告别“回调地狱（Callback Hell）”。
-- **🎯 One Ring Per Thread 无锁调度**: 采用主从 Proactor 多线程模型。主线程专属 Accept，子线程独立接管 io_uring 数据流。单连接完整生命周期极致绑定单一线程，规避所有跨线程抢锁开销。
-- **⏱️ 内核级定时器代理**: 废弃用户态红黑树/时间轮等繁重逻辑，全面将请求超时、死链检测代理给 io_uring 专属的 `Link Timeout` 机制，降低 CPU 无意义开销。
-- **📦 高性能组件引擎**: 底层内置针对小报文优化的 `MemoryPool` (内存池)；跨线程派发任务采用基于数组的**无锁任务队列**结合内核事件描述符 `eventfd`，以极限开销完成线程间的休眠唤醒。
-
-## 🏗️ 核心架构图解
-模块层次严密划分如下：
-*   **控制与调度层**: `TcpServer`（系统总控封装），`EventLoop`（io_uring 基于事件的底层驱动引擎），`Acceptor`（用于建立高频连接处理的源头）。
-*   **业务抽象层**: `TcpConnection`（抽象与追踪 TCP 整个闭环生命周期及异步读写流），`IoContext`（将 I/O 操作、回调指针、底层内存高度封装并投递给内核态的 `user_data`）。
-*   **公共组件设施**: `Buffer`（智能动扩容读写应用缓冲区），`MemoryPool`（多级碎片整理内存池）。
-
-## 🛠️ 环境依赖 (Prerequisites)
-运行本系统需要较新的 Linux 内核以支持 io_uring 的完整特性，同时需要支持 C++20 的构建体系。
-*   **操作系统**: Linux Kernel **5.10+** (强烈推荐 5.19 或更高版本以获得极速特性和完美调度)。
-*   **编译器**: GCC **11.0+** 或 Clang **14.0+** (需完整支持 C++20 协程语义)。
-*   **依赖库**: 
-    - [liburing](https://github.com/axboe/liburing) (推荐 v2.2 及以上版本，作为 io_uring 的官方 C 接口封装)
-    - [fmt](https://github.com/fmtlib/fmt) 现代 C++ 格式化库
-*   **构建工具**: CMake **3.10+**
-
-## 📂 项目结构
-```text
-UCP/
-├── bin/            # 编译输出的可执行文件及核心二进制
-├── build/          # CMake 构建中间目录
-├── benchmark.sh    # 自动化抗压测试脚本
-├── client/         # 各种异常边界与稳定连通性测试客户端
-├── config/         # 默认启动与性能参数集
-├── include/        # 核心框架逻辑声明定义
-├── log/            # 高性能落地无锁日志系统具体实现
-├── memory/         # Slab环形缓冲级别内存池机制
-└── src/            # UCP 框架核心通信机制与事件实现
-```
-
-## ⚙️ 配置与日志系统
-项目新增轻量级通用 `.conf` (INI风格) 配置文件，系统默认路径为 `config/ucp.conf`。通过配置文件可从运行逻辑剥离各项底层参数进而调优。
-
-与此同时，UCP 框架内置极速多 Sink 异步非阻塞日志系统。直接将 I/O 线程日志无锁打入内存队列，再通过独立的日志线程专门执行刷盘（Flush）操作避免卡死 I/O 主流程。
-
-<details>
-<summary><b>👉 点击查看核心配置范例 (ucp.conf)</b></summary>
-
-```ini
-[server]
-name = TcpServer
-ip = 0.0.0.0
-port = 8888
-thread_num = 16
-read_timeout_ms = 5000
-
-[event_loop]
-ring_entries = 32768
-sqpoll = true
-sqpoll_idle_ms = 50
-registered_buffers_count = 16384
-registered_buffer_size = 4096
-pending_queue_capacity = 65536
-
-[log]
-level = INFO
-file = logs/server.log
-max_size = 104857600
-max_files = 10
-async = true
-console = true
-flush_interval_ms = 1000
-```
-</details>
-
-<details>
-<summary><b>👉 点击查看日志接入及特色参数说明</b></summary>
-
-核心极速特性与功能支持：
-- **异步无阻塞落盘**: 日志写入端执行彻底无锁的 `Push（推入队列与EventFD）` 极大拉低日志对于请求耗时与计算单元拖拽。
-- **动态自适应输出**: 支持从 `TRACE` 到 `FATAL` 共计 6 级颗粒输出，完全支撑高度调试环境需要。
-- **极佳分流支持**: 基于大小的 Rotate，保留一定总数的滚卷策略 (`max_size / max_files`)，控制磁盘增长边界。同时灵活控制 `Console(前台)` 和 `Async File Sink` 的定向策略。
-
-极简洁的框架内置宏调用：
-```cpp
-LOG_INFO("Server started on {}:{}", ip, port);
-LOG_WARN("Connection timeout: fd={}", fd);
-LOG_ERROR("Accept failed: {}", strerror(errno));
-```
-</details>
-
-
-
-
-## 🚀 快速开始 (Getting Started)
-
-### 1. 构建 UCP 框架
-```bash
-mkdir build && cd build
-cmake ..
-make -j"$(nproc)"
-```
-
-### 2. 启动单机 UCP 微服务
-> **注:** 为了应对千万级并发网络风暴，首要解决的是重置操作系统硬性 FD 上线，并发起针对 io_uring 内核常驻内存配置 `unlimited`！
-```bash
-cd /home/hegang/UCP 
-sudo sh -c "ulimit -n 100000 && ulimit -l unlimited && ./bin/proactor_test config/ucp.conf"
-```
-
-### 3. 一次性边界回归与连通性自验证客户端
-我们在系统中内置了一个专门用于进行连通性确认、延迟异常与业务鲁棒性对抗的套件程序：
-```bash
-cd /home/hegang/UCP
-./client/test_client all
-```
-> *(执行上述命令会依次验证正常收发、慢速客户端抗压、无响应 TCP 空闲踢除、非法越权断开等关键用例)*
-
-## 📊 性能表现与抗压结果 (Benchmarks)
-我们在极度苛刻、完全剥离并且**不受物理网卡带宽妥协的本机局域网 Loopback 环回测试**环境中，对本系统的高阶吞吐极值天花板能力展开拷机实战：
-
-运行自带的一体化自动化压测工具集：
-```bash
-./benchmark.sh
-```
-
-**实战压测报告：**
-- **测试硬件宿主**: Intel Core i7-14700HX
-- **主被动压测设置**: 运行 16 条系统级 Sub Proactor 子线程, 基于强烈的 Ping-Pong Echo 短包高频业务对抗
-- **成绩汇总**: 在与压测端建立多达 **4000 个 TCP 真实并发连接** 后，系统展现出了极佳的吞吐与延迟控制能力。单侧峰值处理能力达到了 **124万 RPS (每秒请求处理量)**、约 **129.67 MB/s 的传输吞吐量**，且在高压满载状态下，平均通信延迟稳定保持在 **1.49ms - 1.62ms** 之间，P99延迟控制在8ms上下。
-
-<details>
-<summary><b>👉 点击查看详细的 3000 ~ 4000 并发分级压测报告日志输出</b></summary>
+## 架构
 
 ```text
-Connections: 3000
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3000 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.93ms    1.83ms  29.57ms   85.21%
-    Req/Sec    55.07k    26.01k  158.73k    63.89%
-  Latency Distribution
-     50%    1.17ms
-     75%    2.36ms
-     90%    4.58ms
-     99%    8.36ms
-  21975865 requests in 19.33s, 2.23GB read
-  Socket errors: connect 906, read 0, write 0, timeout 1826
-Requests/sec: 1137024.45
-Transfer/sec:    118.19MB
-==========================================================
-Connections: 3100
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3100 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.94ms    1.79ms  28.07ms   85.31%
-    Req/Sec    55.16k    27.17k  151.30k    56.14%
-  Latency Distribution
-     50%    1.21ms
-     75%    2.29ms
-     90%    4.54ms
-     99%    8.28ms
-  21922823 requests in 20.09s, 2.23GB read
-  Socket errors: connect 961, read 0, write 0, timeout 0
-Requests/sec: 1091131.82
-Transfer/sec:    113.42MB
-==========================================================
-Connections: 3200
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3200 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.52ms    1.58ms  39.24ms   88.04%
-    Req/Sec    59.24k    35.03k  137.25k    53.40%
-  Latency Distribution
-     50%    0.98ms
-     75%    1.46ms
-     90%    3.59ms
-     99%    7.83ms
-  23564018 requests in 20.10s, 2.39GB read
-  Socket errors: connect 1366, read 0, write 0, timeout 0
-Requests/sec: 1172534.16
-Transfer/sec:    121.89MB
-==========================================================
-Connections: 3300
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3300 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.57ms    1.59ms  27.64ms   87.11%
-    Req/Sec    57.66k    32.87k  147.78k    57.29%
-  Latency Distribution
-     50%    0.99ms
-     75%    1.58ms
-     90%    3.77ms
-     99%    7.75ms
-  22978590 requests in 19.20s, 2.33GB read
-  Socket errors: connect 1449, read 0, write 0, timeout 1520
-Requests/sec: 1196849.19
-Transfer/sec:    124.41MB
-==========================================================
-Connections: 3400
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3400 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.75ms    1.80ms  61.81ms   85.58%
-    Req/Sec    55.30k    27.58k  137.42k    65.67%
-  Latency Distribution
-     50%    1.03ms
-     75%    1.96ms
-     90%    4.31ms
-     99%    8.05ms
-  22010875 requests in 19.12s, 2.23GB read
-  Socket errors: connect 1447, read 0, write 0, timeout 1629
-Requests/sec: 1151013.45
-Transfer/sec:    119.65MB
-==========================================================
-Connections: 3500
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3500 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.51ms    9.50ms 213.23ms   99.23%
-    Req/Sec    55.84k    30.61k  126.41k    60.82%
-  Latency Distribution
-     50%    1.17ms
-     75%    2.09ms
-     90%    4.59ms
-     99%   10.27ms
-  22119217 requests in 19.10s, 2.25GB read
-  Socket errors: connect 1348, read 0, write 0, timeout 2068
-Requests/sec: 1158362.75
-Transfer/sec:    120.41MB
-==========================================================
-Connections: 3600
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3600 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.90ms    1.78ms  25.12ms   85.35%
-    Req/Sec    55.60k    28.94k  141.35k    64.91%
-  Latency Distribution
-     50%    1.19ms
-     75%    2.13ms
-     90%    4.51ms
-     99%    8.29ms
-  22042657 requests in 20.10s, 2.24GB read
-  Socket errors: connect 1422, read 0, write 0, timeout 0
-Requests/sec: 1096652.98
-Transfer/sec:    114.00MB
-==========================================================
-Connections: 3700
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3700 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.81ms    1.75ms  26.81ms   86.27%
-    Req/Sec    56.76k    32.54k  151.85k    58.92%
-  Latency Distribution
-     50%    1.15ms
-     75%    1.90ms
-     90%    4.32ms
-     99%    8.36ms
-  22582506 requests in 19.12s, 2.29GB read
-  Socket errors: connect 1572, read 0, write 0, timeout 1990
-Requests/sec: 1180823.03
-Transfer/sec:    122.75MB
-==========================================================
-Connections: 3800
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3800 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.75ms    1.74ms  35.99ms   86.57%
-    Req/Sec    54.77k    32.84k  141.30k    60.87%
-  Latency Distribution
-     50%    1.11ms
-     75%    1.80ms
-     90%    4.22ms
-     99%    8.33ms
-  21727679 requests in 19.14s, 2.21GB read
-  Socket errors: connect 1790, read 0, write 0, timeout 1920
-Requests/sec: 1134934.46
-Transfer/sec:    117.98MB
-==========================================================
-Connections: 3900
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 3900 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.49ms    1.48ms  26.11ms   88.83%
-    Req/Sec    60.03k    37.79k  156.42k    62.21%
-  Latency Distribution
-     50%    1.03ms
-     75%    1.48ms
-     90%    3.32ms
-     99%    7.52ms
-  23854640 requests in 19.12s, 2.42GB read
-  Socket errors: connect 1946, read 0, write 0, timeout 1822
-Requests/sec: 1247384.53
-Transfer/sec:    129.67MB
-==========================================================
-Connections: 4000
-Running 20s test @ http://192.168.2.69:6666
-  20 threads and 4000 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.62ms    1.55ms  28.08ms   87.31%
-    Req/Sec    60.58k    33.17k  166.98k    68.93%
-  Latency Distribution
-     50%    1.09ms
-     75%    1.65ms
-     90%    3.81ms
-     99%    7.66ms
-  23976229 requests in 20.10s, 2.43GB read
-  Socket errors: connect 1915, read 0, write 0, timeout 0
-Requests/sec: 1193004.26
-Transfer/sec:    124.01MB
-==========================================================
+Client
+  |
+  v
+TcpServer -> downstream TcpConnection
+                    |
+                    v
+              ProxySession
+              /    |     \
+     HttpFramer  RouteTable  GatewayMetricShard
+                    |
+                    v
+       worker-local UpstreamPool
+                    |
+                    v
+           AsyncConnect / TcpConnection
+                    |
+                    v
+                 Upstream
 ```
-</details>
 
-## 📄 开源协议 (License)
-本项目遵守 **[MIT](https://opensource.org/licenses/MIT)** 开源协议。欢迎同样沉迷于 C++ 极致性能、现代协程编程和疯狂压榨底层 Linux io_uring 引擎魔力的同好，提交 `PR` 或 `Issue`。
+主 EventLoop 负责 accept 和进程级生命周期；连接由 `TcpServer` 分派到 worker。
+业务协程只操作本 worker 的连接和状态，因此热路径不需要全局连接池锁。跨 worker
+指标只在快照阶段聚合。
 
----
+## HTTP 边界
 
-## 🔮 未来演进与优化方向 (TODO)
-为了进一步探索单机网络框架的极限，系统未来将在以下维度持续演进：
+当前支持：
 
-1. **多重注册机制 (Fixed Files)**
-   - 除了当前已支持的 `Registered Buffers` 优化外，计划引入 `io_uring` 的 `Fixed Files`（固定文件描述符）特性。在海量并发建立时，绕过内核层面的 `fget/fput` 开销，进一步压榨高频短连接下的新建吞吐量极值。
-2. **NUMA 架构亲和性感知匹配 (NUMA-Aware)**
-   - 针对部分高端多 CPU 插槽服务器，优化线程绑定策略和内存分配池在物理拓扑上的亲和性，降低跨节点访问带来的不可预知延迟。
-3. **HTTP 解析协程化无缝集成**
-   - 当前针对 TCP 层做了高度优化，未来可拓展提供高性能 HTTP/1.1 与 HTTP/2 的零拷贝解析器（如接驳 `picohttpparser`），将其与现有的异步 Coroutine 机制全面打通，打造一站式网关底层引擎。
-4. **环形无锁队列（Ring Buffer）升级**
-   - 进一步升级现有的任务分发队列，引入更激进的基于 `CAS` 前置计算与 Cache Line 伪共享（False Sharing）对齐隔离的无锁并发队列，以在超高并行度的 Sub Proactor 架构下消除隐性性能抖动。
-5. **io_uring `Multishot Accept / Receive` 支持**
-   - 跟进利用较高版本内核（Linux 5.19+）的 `IORING_OP_ACCEPT_MULTISHOT` 和 `IORING_OP_RECV_MULTISHOT` 机制。只需投递一次 SQE，就能持续不断地在 CQE 中收割新连接或数据，极致削减高频事件的投递损耗。
-6. **BPF/XDP 流量前置过滤与负载均衡**
-   - 探索 eBPF 机制在应用层的联动，将某些特定连接的过滤或解析逻辑下沉挂载至网卡驱动层（XDP），避免无效的 Socket 唤醒，为 UCP 注入更深度的宿主防护与硬件级旁路分发能力。
-7. **`splice()` / `sendfile()` 与 io_uring 串联机制**
-   - 针对特定大文件推流或反向代理网关场景，融合 `io_uring` 对管线拷贝（Splice/Sendfile）的支持，实现彻底绕开用户态内存的 Disk-to-Socket 的纯零拷贝转发直通车。
+- HTTP/1.1 `GET` 和 `POST`；
+- 显式 `Content-Length`；
+- 下游与上游 keep-alive；
+- 每条下游连接同一时刻一个请求；
+- 最大 16 KiB 请求头和最大 1 MiB 请求体，均可通过配置收紧；
+- hop-by-hop `Connection` 头规范化；
+- 静态最长前缀路由和无重试的上游选择。
 
-### 🧩 框架内建业务功能扩展
-除了对系统底层 I/O 引擎的极限榨取，UCP 框架作为基础设施层，未来计划在自身服务组件体系内横向扩展以下更通用的应用级能力，以满足复杂的工程化落地需求：
+当前会拒绝或不实现：
 
-1. **灵活的动态路由调度器 (Router & Dispatcher)**
-   - 内置强大的层级路由规则匹配能力。无论是基于纯文本协议(如 HTTP URI正则)还是二进制 RPC 的命令字，开发者均可通过声明式 API 轻松建立接口到 C++20 特定处理协程的绑定映射，极大消除业务层的面条式分发逻辑代码。
-2. **高可扩展的洋葱模型中间件 (Middleware Pipeline)**
-   - 在 TCP 连接建立、应用层解码到核心逻辑执行的各生命周期节点注入拦截与钩子机制。允许开发者采用插件化的形式无痛挂载统一鉴权验证、全局异常兜底、通用全链路上下文(TraceID)透传等切面功能，做到核心业务逻辑与周边策略的高度解耦。
-3. **原生限流、熔断与降级机制 (Resilience & Rate Limiting)**
-   - 为了应对高并发下的非预期突发流量及后端服务抖动，框架集成了令牌桶/漏桶算法限流哨兵，与实时探活熔断器。在面对依赖过载或异常突增时能够自动短路失败并降级返回，有效避免级联雪崩，将容错弹性沉淀到框架最底层。
-4. **全异步连接池与客户端负载均衡 (Connection Pool & LB)**
-   - 针对分布式网关与中台代理使用场景，提供稳定、可动态伸缩且面向协程的客户端长连接池管理方案，配合轮询、加权随机以及特定业务键一致性 Hash 等多种内置微服务流量分配与智能负载均衡策略，将并发请求极度均匀地分发至后端节点。
-5. **云原生可观测性探针与指标导出 (Observability & Metrics)**
-   - 内置轻量化、极低侵入性的运行时性能探针，支持以极低内核损耗实时汇总连接存活数、读写吞吐速率、内部协程内存占用及响应延迟直方图等核心体检数据，并对外提供适配 Prometheus/OpenTelemetry 标准协议的 Pull/Push 导出端点，让系统的健康状况一目了然。
+- HTTP/1.0、`PUT` 等非 GET/POST 方法和 `CONNECT`；
+- chunked transfer encoding、Upgrade、WebSocket 和并发流水线请求；
+- TLS、HTTP/2、HTTP/3；
+- 路径重写、服务发现、动态配置、自动重试和主动健康检查；
+- 鉴权、限流、熔断、管理 API 和完整的生产级 HTTP 兼容性。
+
+这些限制是当前学习项目的明确边界。尤其是请求一旦部分发送到上游，自动重试可能
+重复执行 POST，因此当前实现选择返回错误而不是隐式重放。
+
+## 环境
+
+- Linux，内核需要支持仓库所用的 `io_uring` 操作；
+- CMake 3.16 或更高版本；
+- 支持 C++20 协程的 GCC 或 Clang；
+- `liburing`、`fmt` 和 pthread；
+- 可选：`wrk`，用于 direct-vs-proxy 基准。
+
+Ubuntu/Debian 可安装基础依赖：
+
+```bash
+sudo apt install cmake g++ liburing-dev libfmt-dev wrk
+```
+
+## 构建与测试
+
+Debug 构建和完整 CTest：
+
+```bash
+cmake -S . -B build-gateway \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON
+cmake --build build-gateway -j2
+ctest --test-dir build-gateway --output-on-failure
+```
+
+ASan/UBSan：
+
+```bash
+cmake -S . -B build-gateway-asan \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DUCP_ENABLE_SANITIZERS=ON
+cmake --build build-gateway-asan -j2
+ctest --test-dir build-gateway-asan --output-on-failure
+```
+
+TSan 必须单独构建：
+
+```bash
+cmake -S . -B build-gateway-tsan \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DUCP_ENABLE_TSAN=ON
+cmake --build build-gateway-tsan -j2
+ctest --test-dir build-gateway-tsan --output-on-failure
+```
+
+当前 WSL2 环境的 GCC TSan 会随机因 shadow-memory mapping 冲突而无法启动进程，
+不能把未执行的用例表述为通过。完整观察记录见
+[TSan notes](docs/tsan-notes.md)。
+
+## 启动代理
+
+先启动两个确定性 benchmark upstream：
+
+```bash
+build-gateway/bin/gateway_mock_upstream --port 9001
+build-gateway/bin/gateway_mock_upstream --port 9002
+```
+
+再启动网关：
+
+```bash
+build-gateway/bin/ucp_gateway config/gateway.conf
+```
+
+默认监听 `127.0.0.1:8080`，`/api/` 路由轮询访问
+`127.0.0.1:9001` 与 `127.0.0.1:9002`。进程通过 SIGINT/SIGTERM 进入优雅关闭。
+
+连通性检查：
+
+```bash
+curl --fail --output /dev/null http://127.0.0.1:9001/bytes/1024
+curl --fail --output /dev/null http://127.0.0.1:8080/api/bytes/1024
+```
+
+## 性能验证
+
+固定矩阵会对 1 KiB、4 KiB、16 KiB 响应分别执行 direct 和 proxy 的 warm-up，
+随后在 64、256、1024 连接下运行 30 秒。脚本保存原始 stdout/stderr，并在 wrk
+报告 socket 或 HTTP 错误时返回非零状态。
+
+```bash
+bench/run_gateway_bench.sh \
+  --gateway http://127.0.0.1:8080 \
+  --direct http://127.0.0.1:9001 \
+  --output benchmark-results \
+  --threads "$(nproc)"
+```
+
+30 分钟 soak 增加 `--soak`。仓库不预填吞吐数字；环境、完整命令、结果表与解释
+规则见 [benchmark report](docs/gateway-benchmark.md)。只有无 socket/HTTP 错误的
+同环境 direct/proxy 数据才适合比较。
+
+## 文档入口
+
+- [架构与边界设计](docs/superpowers/specs/2026-08-31-ucp-proxy-core-design.md)
+- [逐任务实现计划](docs/superpowers/plans/2026-08-31-ucp-proxy-core.md)
+- [TSan 实测与限制](docs/tsan-notes.md)
+- [基准命令与结果模板](docs/gateway-benchmark.md)
+
+## 已知限制与后续方向
+
+当前代码仍应在原生 Linux 上完成全套 TSan，并通过真实硬件的 long-running soak
+建立性能基线。后续优先级应保持在故障注入、资源上限、观测导出和协议正确性，
+而不是在缺少证据时扩展功能或宣称峰值吞吐。

@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "MemoryPool.hpp"
+#include "ucp/runtime/CompletionData.hpp"
 
 /**
  * IO 上下文，用于绑定到 io_uring 的 user_data
@@ -26,7 +27,7 @@ enum class IoType
 };
 
 // IO 上下文，用于绑定到 io_uring 的 user_data
-struct IoContext
+struct IoContext : public ucp::CompletionData
 {
     IoType type;
     int fd;  // 文件描述符
@@ -43,7 +44,14 @@ struct IoContext
 
     int result_; // 暂存 IO 操作结果，用作将io_uring读写操作的结果中转到协程
 
-    IoContext(IoType t, int f) : type(t), fd(f), idx(-1), coro_handle(nullptr), result_(0), handler(nullptr)
+    IoContext(IoType t, int f)
+        : ucp::CompletionData(ucp::CompletionDataKind::legacyContext)
+        , type(t)
+        , fd(f)
+        , idx(-1)
+        , coro_handle(nullptr)
+        , result_(0)
+        , handler(nullptr)
     {
     }
 
