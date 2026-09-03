@@ -1,0 +1,34 @@
+# UCP Proxy Core environment dependencies (Ubuntu 22.04 / 24.04)
+#
+# This is an APT package manifest, not a Python pip requirements file.
+# Install all development and benchmark packages with:
+#   sudo scripts/install_dependencies.sh
+
+[build]
+build-essential
+cmake
+pkg-config
+liburing-dev
+libfmt-dev
+
+[development]
+git
+ca-certificates
+curl
+
+[benchmark-and-observability]
+wrk
+sysstat
+procps
+iproute2
+
+# Optional tools, installed manually when needed:
+# clang
+# gdb
+# ninja-build
+# linux-tools-common
+# linux-tools-$(uname -r)
+
+# Runtime-only deployments built on the same Ubuntu release need the runtime
+# libraries supplied by the build dependencies above. Do not install Docker for
+# native deployment or performance benchmarking.

@@ -73,7 +73,7 @@ TcpServer -> downstream TcpConnection
 这些限制是当前学习项目的明确边界。尤其是请求一旦部分发送到上游，自动重试可能
 重复执行 POST，因此当前实现选择返回错误而不是隐式重放。
 
-## 环境
+## 环境与原生构建
 
 - Linux，内核需要支持仓库所用的 `io_uring` 操作；
 - CMake 3.16 或更高版本；
@@ -81,13 +81,26 @@ TcpServer -> downstream TcpConnection
 - `liburing`、`fmt` 和 pthread；
 - 可选：`wrk`，用于 direct-vs-proxy 基准。
 
-Ubuntu/Debian 可安装基础依赖：
+在 Ubuntu 上进入仓库目录后，运行安装脚本：
 
 ```bash
-sudo apt install cmake g++ liburing-dev libfmt-dev wrk
+sudo scripts/install_dependencies.sh
 ```
 
-## 构建与测试
+仅构建和运行测试时，可使用精简安装：
+
+```bash
+sudo scripts/install_dependencies.sh --build-only
+```
+
+先克隆仓库并进入项目目录：
+
+```bash
+git clone <repository-url>
+cd uring_coroutine_proactor
+```
+
+### Debug 构建与单元测试
 
 Debug 构建和完整 CTest：
 
@@ -97,6 +110,17 @@ cmake -S . -B build-gateway \
   -DBUILD_TESTING=ON
 cmake --build build-gateway -j2
 ctest --test-dir build-gateway --output-on-failure
+```
+
+### Release 构建
+
+性能测试应使用 Release 构建，而不是 Debug 或 sanitizer 构建：
+
+```bash
+cmake -S . -B build-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF
+cmake --build build-release --target ucp_gateway gateway_mock_upstream -j"$(nproc)"
 ```
 
 ASan/UBSan：
@@ -125,19 +149,22 @@ ctest --test-dir build-gateway-tsan --output-on-failure
 不能把未执行的用例表述为通过。完整观察记录见
 [TSan notes](docs/tsan-notes.md)。
 
-## 启动代理
+## 本地启动与验证
 
-先启动两个确定性 benchmark upstream：
+`gateway_mock_upstream` 是仓库自带的确定性 HTTP 上游模拟器，支持
+`/bytes/1024`、`/bytes/4096` 和 `/bytes/16384`。在三个终端中分别启动两个
+模拟上游和网关：
 
 ```bash
-build-gateway/bin/gateway_mock_upstream --port 9001
-build-gateway/bin/gateway_mock_upstream --port 9002
+build-release/bin/gateway_mock_upstream --port 9001
 ```
 
-再启动网关：
+```bash
+build-release/bin/gateway_mock_upstream --port 9002
+```
 
 ```bash
-build-gateway/bin/ucp_gateway config/gateway.conf
+build-release/bin/ucp_gateway config/gateway.conf
 ```
 
 默认监听 `127.0.0.1:8080`，`/api/` 路由轮询访问
@@ -149,6 +176,106 @@ build-gateway/bin/ucp_gateway config/gateway.conf
 curl --fail --output /dev/null http://127.0.0.1:9001/bytes/1024
 curl --fail --output /dev/null http://127.0.0.1:8080/api/bytes/1024
 ```
+
+使用 `Ctrl-C` 或向进程发送 `SIGTERM` 可触发优雅关闭。
+
+## Ubuntu 原生部署与双服务器压测
+
+网关服务器 A 与压测服务器 B 应位于同一云厂商的同一 VPC/私网内，避免公网链路、NAT
+或公网带宽成为测试瓶颈。整个流程直接运行 Ubuntu 进程，不需要容器运行时。
+
+```text
+压测服务器 B (wrk) -> 网关服务器 A:8080 -> A 上的 mock upstream:9001/9002
+```
+
+### 1. 准备两台服务器
+
+建议使用 Ubuntu 22.04 或 24.04。两台服务器都执行：
+
+```bash
+git clone <repository-url>
+cd uring_coroutine_proactor
+sudo scripts/install_dependencies.sh
+uname -r
+nproc
+ulimit -n 1048576
+```
+
+只构建网关时可在压测机使用 `--build-only`；压测机仍需 `wrk`、`sysstat` 和
+`iproute2` 来采集结果。云安全组和主机防火墙只允许服务器 B 的私网 IP 访问服务器 A
+的 `8080/tcp`，不要对外开放 mock upstream 端口。
+
+### 2. 配置并启动网关服务器 A
+
+本地配置默认只监听回环地址。双服务器测试前复制配置并将 `listen_ip` 改为服务器 A
+的私网地址或 `0.0.0.0`，同时按 CPU 核数调整 `workers`：
+
+```bash
+cp config/gateway.conf config/gateway.server.conf
+$EDITOR config/gateway.server.conf
+```
+
+配置中的上游可继续使用 `127.0.0.1:9001,127.0.0.1:9002`，因为 mock 服务与网关在同一
+台服务器上。推荐先以 `workers=1`、CPU 一半和 CPU 全核分别测试；`ring_entries`、
+`sqpoll`、注册缓冲区和 `max_connections_per_worker` 也应一次只调整一个变量。
+
+在服务器 A 的三个终端启动两个上游和网关：
+
+```bash
+build-release/bin/gateway_mock_upstream --port 9001
+build-release/bin/gateway_mock_upstream --port 9002
+build-release/bin/ucp_gateway config/gateway.server.conf
+```
+
+```bash
+ss -ltn '( sport = :8080 or sport = :9001 or sport = :9002 )'
+curl --fail --output /dev/null http://127.0.0.1:8080/api/bytes/1024
+```
+
+### 3. 在服务器 B 逐级压测
+
+先验证低并发，再逐级提高连接数；每一组结束后确认没有错误再继续：
+
+```bash
+export GATEWAY_IP=10.0.1.10
+wrk --latency -t4 -c64 -d30s "http://${GATEWAY_IP}:8080/api/bytes/1024"
+wrk --latency -t8 -c256 -d30s "http://${GATEWAY_IP}:8080/api/bytes/4096"
+wrk --latency -t8 -c1024 -d60s "http://${GATEWAY_IP}:8080/api/bytes/4096"
+wrk --latency -t16 -c2048 -d60s "http://${GATEWAY_IP}:8080/api/bytes/16384"
+```
+
+服务器 A 观察网关 CPU、内存、监听连接和日志；服务器 B 观察压测机 CPU、文件描述符、
+临时端口和带宽：
+
+```bash
+# 服务器 A
+pidstat -dur -p "$(pgrep -n -x ucp_gateway)" 1
+ss -s
+
+# 服务器 B
+mpstat -P ALL 1
+sar -n DEV 1
+ss -s
+```
+
+只有 `wrk` 无 `Socket errors`、HTTP 状态正确、两台机器仍有资源余量且网关无协议/超时/
+资源耗尽错误时，结果才可用于比较。记录 Requests/sec、平均延迟、P99、CPU/内存、网络
+吞吐、完整命令和配置；错误率或 P99 持续上升通常表示已经接近极限。
+
+### 4. 原生 io_uring 故障排查
+
+```bash
+# 0 表示内核没有全局禁用 io_uring
+cat /proc/sys/kernel/io_uring_disabled
+ulimit -n
+ulimit -l
+pgrep -a ucp_gateway
+ss -ltn '( sport = :8080 or sport = :9001 or sport = :9002 )'
+```
+
+若出现 `Operation not permitted`，先确认云主机内核和安全策略允许 io_uring；若出现连接
+错误，优先检查安全组、文件描述符、临时端口、网卡带宽和网关日志，不要直接把并发数继续
+提高。
 
 ## 性能验证
 
