@@ -377,6 +377,9 @@ Task<IoResult> ProxySession::streamExact(
             source, std::span(scratch_).first(requested), deadline);
         if (!read) {
             if (read.error().code == ErrorCode::eof) {
+                if (source == downstream_) {
+                    cancelInLoop();
+                }
                 co_return IoResult::failure(
                     {ErrorCode::protocol, 0,
                      "stream ended before Content-Length"});
@@ -448,6 +451,7 @@ void ProxySession::cancelInLoop()
         return;
     }
     cancelled_ = true;
+    recordCancellation();
     if (currentUpstream_) {
         currentUpstream_->cancelPendingOperations();
     }
@@ -500,13 +504,21 @@ void ProxySession::recordError(const Error& error) noexcept
         metrics_->timeoutErrors.fetch_add(1, std::memory_order_relaxed);
         break;
     case ErrorCode::cancelled:
-        metrics_->cancellations.fetch_add(1, std::memory_order_relaxed);
+        recordCancellation();
         break;
     case ErrorCode::resourceExhausted:
         metrics_->overloadErrors.fetch_add(1, std::memory_order_relaxed);
         break;
     default:
         break;
+    }
+}
+
+void ProxySession::recordCancellation() noexcept
+{
+    if (metrics_ && !cancellationRecorded_) {
+        metrics_->cancellations.fetch_add(1, std::memory_order_relaxed);
+        cancellationRecorded_ = true;
     }
 }
 

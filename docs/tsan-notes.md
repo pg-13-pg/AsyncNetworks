@@ -1,10 +1,10 @@
 # ThreadSanitizer Verification Notes
 
-Date: 2026-09-02
+Date: 2026-09-03
 
 ## Environment
 
-- Kernel: `Linux 6.18.33.2-microsoft-standard-WSL2 x86_64`
+- Kernel: `Linux 6.8.0-137-generic x86_64`
 - Compiler: `g++ 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)`
 - CMake: `3.28.3`
 - liburing: `2.5`
@@ -20,15 +20,11 @@ cmake --build build-gateway-tsan -j2
 ctest --test-dir build-gateway-tsan --output-on-failure
 ```
 
-Configuration and compilation completed successfully. TSan results on this
-WSL2 host are nondeterministic because many processes fail while reserving the
-TSan shadow address space. The final handoff run completed 2 of 12 tests
-without a TSan report (`ucp_io_operation_test` and
-`ucp_event_loop_operation_test`). Of the other 10 tests, eight failed directly
-with `unexpected memory mapping`, `ucp_proxy_session_test` had a startup
-segmentation fault, and the shutdown test's signal-path child failed shadow
-memory initialization so its parent assertion failed. None produced an
-application race report.
+This is a native Ubuntu Linux host, not WSL2. With its default ASLR setting,
+GCC ThreadSanitizer fails during startup with `unexpected memory mapping`.
+The failure occurs even in `ucp_result_test`, which does not create an
+EventLoop or submit io_uring work, so it is not an application race or a
+liburing-specific failure.
 
 Representative output from the smallest test was:
 
@@ -37,9 +33,18 @@ Start 1: ucp_result_test
 FATAL: ThreadSanitizer: unexpected memory mapping 0x5d8cc2256000-0x5d8cc2258000
 ```
 
-`ucp_result_test` does not create an EventLoop or submit io_uring operations.
-Its startup failure therefore shows that the mapping error is not a
-liburing-specific report.
+The CTest registration disables ASLR only for Linux x86_64 TSan test
+processes by launching them with `setarch x86_64 -R`. This is applied
+automatically when `UCP_ENABLE_TSAN=ON`; the normal and ASan/UBSan test
+commands are unchanged. `setarch` is required at CMake configure time for
+this configuration.
+
+With that launcher, the standard commands above completed all 12 tests on
+this host in 2.45 seconds, with no TSan report:
+
+```text
+100% tests passed, 0 tests failed out of 12
+```
 
 ## Races Found And Fixed
 
@@ -62,7 +67,7 @@ still executing `notify_all()`. Local phase-completion predicates and their
 notifications now execute under the same `shutdownMutex_`, so a waiter cannot
 return and destroy the condition variable before notification completes.
 
-Post-fix targeted evidence:
+Post-fix targeted evidence (the CTest launcher is applied automatically):
 
 ```bash
 ctest --test-dir build-gateway-tsan --output-on-failure \
@@ -81,13 +86,6 @@ failed at initialization before application code.
 
 ## Interpretation
 
-The final full TSan suite is **not clean** because 10 processes did not
-initialize. The successful runs are useful evidence for the exercised paths,
-but they do not justify a project-wide race-free claim. A suppression is not
-appropriate: the remaining failure is a fatal shadow-memory mapping conflict,
-not a suppressible application stack.
-
-The normal and ASan/UBSan suites independently pass all 12 tests, but they do
-not replace TSan. Before making a race-free claim, rerun the full command on a
-native Linux host where GCC ThreadSanitizer initializes reliably, and preserve
-any reported user-space stack without broad suppressions.
+The full suite now initializes and runs under TSan on this host. A clean run
+means no data race was reported for the exercised paths; it is not proof that
+the entire project is race-free. No TSan suppressions are used.

@@ -1,4 +1,5 @@
 #include "Buffer.hpp"
+#include "Config.hpp"
 #include "EventLoop.hpp"
 #include "InetAddress.hpp"
 #include "TcpConnection.hpp"
@@ -166,36 +167,195 @@ ucp::DetachedTask serveConnection(
     }
 }
 
-bool parsePort(int argc, char** argv, std::uint16_t& port)
+bool parseArguments(
+    int argc,
+    char** argv,
+    std::string& host,
+    std::uint16_t& port,
+    int& workers,
+    std::string& configPath,
+    bool& hostOverride,
+    bool& portOverride,
+    bool& workersOverride)
 {
-    if (argc != 3 || std::string_view(argv[1]) != "--port") {
+    if (argc < 2 || (argc - 1) % 2 != 0) {
         return false;
     }
-    unsigned value = 0;
-    const std::string_view argument(argv[2]);
-    const auto [end, error] = std::from_chars(
-        argument.data(), argument.data() + argument.size(), value);
-    if (error != std::errc{} || end != argument.data() + argument.size()
-        || value == 0 || value > 65535) {
+    host = "127.0.0.1";
+    port = 0;
+    workers = 0;
+    configPath.clear();
+    hostOverride = false;
+    portOverride = false;
+    workersOverride = false;
+    int index = 1;
+    while (index < argc) {
+        if (std::string_view(argv[index]) == "--config" && index + 1 < argc) {
+            configPath = argv[index + 1];
+            if (configPath.empty()) {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if (std::string_view(argv[index]) == "--host" && index + 1 < argc) {
+            host = argv[index + 1];
+            if (host.empty()) {
+                return false;
+            }
+            hostOverride = true;
+            index += 2;
+            continue;
+        }
+        if (std::string_view(argv[index]) == "--port" && index + 1 < argc) {
+            unsigned value = 0;
+            const std::string_view argument(argv[index + 1]);
+            const auto [end, error] = std::from_chars(
+                argument.data(), argument.data() + argument.size(), value);
+            if (error != std::errc{} || end != argument.data() + argument.size()
+                || value == 0 || value > 65535 || portOverride) {
+                return false;
+            }
+            port = static_cast<std::uint16_t>(value);
+            portOverride = true;
+            index += 2;
+            continue;
+        }
+        if (std::string_view(argv[index]) == "--workers" && index + 1 < argc) {
+            unsigned value = 0;
+            const std::string_view argument(argv[index + 1]);
+            const auto [end, error] = std::from_chars(
+                argument.data(), argument.data() + argument.size(), value);
+            if (error != std::errc{} || end != argument.data() + argument.size()
+                || value > 1024) {
+                return false;
+            }
+            workers = static_cast<int>(value);
+            workersOverride = true;
+            index += 2;
+            continue;
+        }
         return false;
     }
-    port = static_cast<std::uint16_t>(value);
-    return true;
+    return !configPath.empty() || portOverride;
 }
 
 void printUsage(const char* program)
 {
-    std::fprintf(stderr, "Usage: %s --port PORT\n", program);
+    std::fprintf(
+        stderr,
+        "Usage: %s --config FILE [--host ADDRESS] [--port PORT] [--workers COUNT]\n"
+        "       %s [--host ADDRESS] [--workers COUNT] --port PORT\n",
+        program, program);
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 {
+    std::string host;
     std::uint16_t port = 0;
-    if (!parsePort(argc, argv, port)) {
+    int workers = 0;
+    std::string configPath;
+    bool hostOverride = false;
+    bool portOverride = false;
+    bool workersOverride = false;
+    if (!parseArguments(argc, argv, host, port, workers, configPath,
+                        hostOverride, portOverride, workersOverride)) {
         printUsage(argv[0]);
         return 2;
+    }
+
+    if (!configPath.empty()) {
+        Config config;
+        std::string configError;
+        if (!config.loadFromFile(configPath, &configError)) {
+            std::fprintf(stderr, "gateway_mock_upstream: %s\n",
+                         configError.c_str());
+            return 1;
+        }
+        if (!hostOverride) {
+            host = config.getString("server.host", host);
+        }
+        if (!portOverride) {
+            const int configuredPort = config.getInt("server.port", 0);
+            if (configuredPort <= 0 || configuredPort > 65535) {
+                std::fprintf(stderr,
+                             "gateway_mock_upstream: invalid server.port\n");
+                return 1;
+            }
+            port = static_cast<std::uint16_t>(configuredPort);
+        }
+        if (!workersOverride) {
+            workers = config.getInt("server.workers", workers);
+        }
+
+        EventLoop::Options options;
+        options.ringEntries = config.getSizeT(
+            "event_loop.ring_entries", options.ringEntries);
+        options.sqpoll = config.getBool("event_loop.sqpoll", options.sqpoll);
+        options.sqpollIdleMs = static_cast<unsigned int>(config.getSizeT(
+            "event_loop.sqpoll_idle_ms", options.sqpollIdleMs));
+        options.registeredBuffersCount = config.getSizeT(
+            "event_loop.registered_buffers_count", options.registeredBuffersCount);
+        options.registeredBuffersSize = config.getSizeT(
+            "event_loop.registered_buffer_size", options.registeredBuffersSize);
+        options.pendingQueueCapacity = config.getSizeT(
+            "event_loop.pending_queue_capacity", options.pendingQueueCapacity);
+        options.pendingSubmissionCapacity = config.getSizeT(
+            "event_loop.pending_submission_capacity", options.pendingSubmissionCapacity);
+        options.pendingQueueHighWaterMark = config.getSizeT(
+            "event_loop.pending_queue_high_water_mark", options.pendingQueueHighWaterMark);
+        options.pendingQueueLowWaterMark = config.getSizeT(
+            "event_loop.pending_queue_low_water_mark", options.pendingQueueLowWaterMark);
+        options.enableQueueFullStats = config.getBool(
+            "event_loop.enable_queue_full_stats", options.enableQueueFullStats);
+
+        // Keep the accept loop and every worker on the same configured path.
+        EventLoop::Options configuredOptions = options;
+        sigset_t signals;
+        ::sigemptyset(&signals);
+        ::sigaddset(&signals, SIGINT);
+        ::sigaddset(&signals, SIGTERM);
+        if (::pthread_sigmask(SIG_BLOCK, &signals, nullptr) != 0) {
+            std::fputs("gateway_mock_upstream: failed to block signals\n", stderr);
+            return 1;
+        }
+        EventLoop loop(configuredOptions);
+        if (!loop.initRegisteredBuffers()) {
+            std::fputs("gateway_mock_upstream: registered buffer initialization failed\n", stderr);
+            return 1;
+        }
+        TcpServer server(&loop, InetAddress(port, host), "gateway-mock-upstream");
+        server.setEventLoopOptions(configuredOptions);
+        server.setThreadNum(workers);
+        std::atomic_bool stopping{false};
+        server.setConnectionCallback([](const std::shared_ptr<TcpConnection>& connection) {
+            serveConnection(connection);
+        });
+        server.setConnectionDestroyedCallback([&] {
+            if (stopping.load(std::memory_order_acquire) && server.connectionCount() == 0) {
+                loop.quit();
+            }
+        });
+        server.start();
+        std::thread signalThread([&] {
+            int signal = 0;
+            if (::sigwait(&signals, &signal) != 0) return;
+            stopping.store(true, std::memory_order_release);
+            loop.queueControlInLoop([&] {
+                server.stopAccepting();
+                server.forEachConnection([](const std::shared_ptr<TcpConnection>& connection) {
+                    connection->forceClose();
+                });
+                if (server.connectionCount() == 0) loop.quit();
+            });
+        });
+        std::printf("gateway_mock_upstream listening on %s:%u\n", host.c_str(), port);
+        std::fflush(stdout);
+        loop.loop();
+        signalThread.join();
+        return 0;
     }
 
     sigset_t signals;
@@ -220,7 +380,8 @@ int main(int argc, char** argv)
     }
 
     TcpServer server(
-        &loop, InetAddress(port, "127.0.0.1"), "gateway-mock-upstream");
+        &loop, InetAddress(port, host), "gateway-mock-upstream");
+    server.setThreadNum(workers);
     std::atomic_bool stopping{false};
     server.setConnectionCallback([](
         const std::shared_ptr<TcpConnection>& connection) {
@@ -252,7 +413,7 @@ int main(int argc, char** argv)
         });
     });
 
-    std::printf("gateway_mock_upstream listening on 127.0.0.1:%u\n", port);
+    std::printf("gateway_mock_upstream listening on %s:%u\n", host.c_str(), port);
     std::fflush(stdout);
     loop.loop();
     signalThread.join();

@@ -57,6 +57,7 @@ private:
     void finish(const std::shared_ptr<ProxySession>& self);
     void recordStatus(int status) noexcept;
     void recordError(const Error& error) noexcept;
+    void recordCancellation() noexcept;
     void recordLatency() noexcept;
 
     std::shared_ptr<TcpConnection> downstream_;
@@ -73,6 +74,7 @@ private:
     Deadline responseDeadline_;
     bool started_{false};
     bool cancelled_{false};
+    bool cancellationRecorded_{false};
     bool responseStarted_{false};
     bool finished_{false};
     bool requestInProgress_{false};

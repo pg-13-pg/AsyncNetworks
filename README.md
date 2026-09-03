@@ -354,12 +354,33 @@ gateway，最高只测试 `1024` 个连接。它不是自动寻找网络或框�
 每组无错误后，以本节的 `wrk` 命令逐级增加连接数，并记录 P99、错误率、FD、CPU、队列和
 网络指标。
 
-当前仓库的 `gateway_mock_upstream` 固定绑定 `127.0.0.1`，因此服务器 B 不能将
-`--direct http://127.0.0.1:9001` 用作 direct baseline。两服务器拓扑中可从 B 压测 gateway
-路径；若需要 strict direct-vs-proxy 对照，必须使用服务器 B 可通过内网访问的 upstream。
-它可以是服务器 A 私网地址上的真实测试服务，也可以在服务器 C 上；安全组仅向服务器 B
-放行对应端口。当前 bundled mock upstream 不具备指定绑定地址的选项，因此不能直接用于该
-跨机 direct baseline，也不应为了运行该对照向公网开放它。
+`gateway_mock_upstream` 默认绑定 `127.0.0.1`。如需从服务器 B 直接测试异步 HTTP
+服务本身，可在服务器 A 上显式绑定私网地址；该路径不会经过网关：
+
+```bash
+build-release/bin/gateway_mock_upstream --host 10.0.0.171 --port 9001
+```
+
+直连服务也支持配置 worker EventLoop 数量。例如使用 8 个 worker：
+
+```bash
+build-release/bin/gateway_mock_upstream \
+  --host 10.0.0.171 --port 9001 --workers 8
+```
+
+然后在服务器 B 上直接压测：
+
+```bash
+wrk --latency -t4 -c1024 -d60s \
+  http://10.0.0.171:9001/bytes/4096
+```
+
+建议将直连服务的 `--workers` 依次设置为 `1`、`4`、`8`，每次重启服务后，
+在相同的客户端线程数、连接数和持续时间下比较 RPS、P99、错误数以及服务器 CPU。
+`/bytes/1024`、`/bytes/4096` 和 `/bytes/16384` 分别用于小响应、中等响应和吞吐压力测试。
+
+这组数据代表异步 HTTP 服务直连吞吐；访问 `:8080/api/...` 才是网关代理链路。
+跨机测试时仅在安全组中向服务器 B 放行对应端口，不要向公网开放。
 
 ```bash
 # 0 表示内核没有全局禁用 io_uring

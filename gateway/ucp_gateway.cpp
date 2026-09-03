@@ -7,12 +7,31 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <thread>
 
 using namespace std::chrono_literals;
 
 namespace {
+
+std::string timestampedLogPath()
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::tm localTime{};
+    ::localtime_r(&time, &localTime);
+
+    std::ostringstream name;
+    name << "logs/ucp_gateway-" << std::put_time(&localTime, "%Y%m%d-%H%M%S")
+         << '-' << std::setfill('0') << std::setw(3) << milliseconds.count()
+         << ".log";
+    return name.str();
+}
 
 void logMetrics(const ucp::proxy::GatewayMetricsSnapshot& metrics)
 {
@@ -82,7 +101,7 @@ int main(int argc, char** argv)
     // Every subsequently created thread must inherit the blocked mask so
     // process-directed termination is consumed only by sigwait().
     Logger::Options logOptions;
-    logOptions.logFile = "logs/ucp_gateway.log";
+    logOptions.logFile = timestampedLogPath();
     Logger::init(logOptions);
 
     EventLoop baseLoop(config.eventLoopOptions);

@@ -1,8 +1,18 @@
+set(UCP_TSAN_TEST_LAUNCHER)
+if(UCP_ENABLE_TSAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    find_program(UCP_SETARCH_EXECUTABLE NAMES setarch)
+    if(NOT UCP_SETARCH_EXECUTABLE)
+        message(FATAL_ERROR "TSan tests on Linux x86_64 require the setarch executable")
+    endif()
+    set(UCP_TSAN_TEST_LAUNCHER ${UCP_SETARCH_EXECUTABLE} x86_64 -R)
+endif()
+
 function(add_ucp_test target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE proactor_static pthread)
     target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests)
-    add_test(NAME ${target} COMMAND ${target})
+    add_test(NAME ${target} COMMAND ${UCP_TSAN_TEST_LAUNCHER} $<TARGET_FILE:${target}>)
 endfunction()
 
 add_ucp_test(ucp_result_test result_test.cpp)

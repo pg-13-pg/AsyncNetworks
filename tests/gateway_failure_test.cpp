@@ -359,7 +359,6 @@ void downstreamCloseCancelsUpload()
     std::string upload =
         "POST /api/upload HTTP/1.1\r\nHost: x\r\n"
         "Content-Length: 1048576\r\n\r\n";
-    upload.append(1024 * 1024, 'u');
     sendAll(client, upload);
     CHECK(TestSupport::waitUntil(
         [&] { return upstream.requests() == 1; }, 2s));
@@ -376,7 +375,7 @@ void downstreamCloseCancelsUpload()
     CHECK_EQ(snapshot.poolAcquisitions, 1U);
     CHECK_EQ(snapshot.poolActiveConnections, 0U);
     CHECK_EQ(snapshot.poolIdleConnections, 0U);
-    CHECK(snapshot.cancellations >= 1U);
+    CHECK_EQ(snapshot.cancellations, 1U);
     gateway.stop(500ms);
 }
 

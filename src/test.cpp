@@ -1,7 +1,10 @@
 #include <chrono>
+#include <ctime>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -14,6 +17,35 @@
 #include "MemoryPool.hpp"
 #include "TcpConnection.hpp"
 #include "TcpServer.hpp"
+
+namespace {
+
+std::string timestampedLogFile(const std::string& configuredPath)
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::tm localTime{};
+    ::localtime_r(&time, &localTime);
+
+    const auto extensionPos = configuredPath.find_last_of('.');
+    const auto hasExtension = extensionPos != std::string::npos
+        && (configuredPath.find_last_of('/') == std::string::npos
+            || extensionPos > configuredPath.find_last_of('/'));
+    const auto stem = hasExtension
+        ? configuredPath.substr(0, extensionPos) : configuredPath;
+    const auto extension = hasExtension
+        ? configuredPath.substr(extensionPos) : std::string{};
+
+    std::ostringstream path;
+    path << stem << '-' << std::put_time(&localTime, "%Y%m%d-%H%M%S")
+         << '-' << std::setfill('0') << std::setw(3) << milliseconds.count()
+         << extension;
+    return path.str();
+}
+
+} // namespace
 
 // ===================== 简单的 HTTP 解析器 =====================
 // 解析 HTTP 请求，提取请求体（如果有）
@@ -235,14 +267,12 @@ int main(int argc, char **argv)
     }
 
     Logger::Options logOptions;
-    Logger::init(logOptions);
 
     Config config; // 读取配置文件，保存到config中
     std::string configError;
     if (!config.loadFromFile(configPath, &configError))
     {
-        LOG_ERROR("Config load failed: {}", configError);
-        Logger::shutdown();
+        std::cerr << "Config load failed: " << configError << '\n';
         return 1;
     }
 
@@ -261,14 +291,14 @@ int main(int argc, char **argv)
     else if (logLevelStr == "FATAL")
         logOptions.level = LogLevel::FATAL;
 
-    logOptions.logFile = config.getString("log.file", "logs/server.log");
+    logOptions.logFile = timestampedLogFile(
+        config.getString("log.file", "logs/server.log"));
     logOptions.maxFileSize = config.getSizeT("log.max_size", 100 * 1024 * 1024);
     logOptions.maxFiles = config.getSizeT("log.max_files", 10);
     logOptions.async = config.getBool("log.async", true);
     logOptions.console = config.getBool("log.console", true);
     logOptions.flushInterval = config.getDurationMs("log.flush_interval_ms", std::chrono::milliseconds(1000));
 
-    Logger::shutdown();
     Logger::init(logOptions);
     LOG_INFO("Logger initialized: level={}, file={}", logLevelStr, logOptions.logFile);
 
