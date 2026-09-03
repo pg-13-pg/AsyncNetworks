@@ -198,14 +198,99 @@ cd uring_coroutine_proactor
 sudo scripts/install_dependencies.sh
 uname -r
 nproc
-ulimit -n 1048576
 ```
 
 只构建网关时可在压测机使用 `--build-only`；压测机仍需 `wrk`、`sysstat` 和
 `iproute2` 来采集结果。云安全组和主机防火墙只允许服务器 B 的私网 IP 访问服务器 A
 的 `8080/tcp`，不要对外开放 mock upstream 端口。
 
-### 2. 配置并启动网关服务器 A
+### 2. 设置资源上限与内核队列
+
+`ulimit -n` 只影响执行它的 shell 及其子进程。网关、两个 mock upstream 和压测工具若
+在不同 SSH 会话或 tmux pane 中启动，必须各自在启动前设置所需的文件描述符上限；不能在
+一个终端设置后假定其他终端会继承。
+
+在网关服务器 A 与压测服务器 B 的实际启动终端中执行：
+
+```bash
+ulimit -Hn
+ulimit -Sn 1048576
+ulimit -Sn
+```
+
+网关的每个活跃代理会话通常同时持有下游和上游 socket，因此 `LimitNOFILE` 必须覆盖目标
+连接数、监听 socket、日志、epoll/io_uring 内部 fd 与余量。`1048576` 是高连接数压测的
+起点，不是吞吐优化项；目标并发较低时应按实际连接预算降低它。
+
+若第一条命令显示的 hard limit 小于目标值，交互式 SSH/tmux 启动方式应先为运行用户创建
+PAM limits 配置，重新登录后再执行 `ulimit`：
+
+```text
+# /etc/security/limits.d/99-ucp-benchmark.conf
+<run-user> soft nofile 1048576
+<run-user> hard nofile 1048576
+```
+
+若通过 systemd 启动网关，应为实际使用的服务单元创建 override，而不是依赖登录 shell：
+
+```bash
+sudo systemctl edit <your-ucp-gateway-service>.service
+```
+
+写入以下内容后重载并重启服务：
+
+```ini
+[Service]
+LimitNOFILE=1048576
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart <your-ucp-gateway-service>.service
+gateway_pid="$(pgrep -n -x ucp_gateway)"
+grep -E 'Max open files|Max locked memory' "/proc/${gateway_pid}/limits"
+```
+
+默认配置的 `registered_buffers_count = 0`，不需要提高 locked-memory 上限。只有启用注册
+缓冲区时才需要为 `LimitMEMLOCK` 预留内存：最小预算为
+`workers * registered_buffers_count * registered_buffer_size`，再加 io_uring 元数据余量。
+例如 `4 * 4096 * 4096 = 64 MiB`，可将服务 override 中的 `LimitMEMLOCK` 设为至少 `128M`，
+并通过上面的 `/proc/<pid>/limits` 检查实际生效值。
+
+连接风暴还会受内核文件表、accept 队列和 SYN 队列限制。先记录现值：
+
+```bash
+# 服务器 A
+sysctl fs.file-max net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+
+# 服务器 B
+sysctl net.ipv4.ip_local_port_range
+```
+
+仅在压测确认这些队列成为瓶颈时，才在专用压测主机上使用如下起点，并将改动与结果一起
+记录。服务器 A 的 `/etc/sysctl.d/99-ucp-benchmark.conf` 只设置服务端项：
+
+```ini
+fs.file-max = 2097152
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+```
+
+服务器 B 的同名文件只设置压测端项：
+
+```ini
+net.ipv4.ip_local_port_range = 1024 65535
+```
+
+```bash
+sudo sysctl --system
+```
+
+单一压测源 IP 对同一目标 IP/端口的可用临时端口数量约等于 `ip_local_port_range` 的范围，
+约 6.4 万个，而不是无限。若探索超过该数量的并发连接，应增加压测机、源 IP 或目标端口，
+不能仅继续提高 `wrk -c`。
+
+### 3. 配置并启动网关服务器 A
 
 本地配置默认只监听回环地址。双服务器测试前复制配置并将 `listen_ip` 改为服务器 A
 的私网地址或 `0.0.0.0`，同时按 CPU 核数调整 `workers`：
@@ -232,7 +317,7 @@ ss -ltn '( sport = :8080 or sport = :9001 or sport = :9002 )'
 curl --fail --output /dev/null http://127.0.0.1:8080/api/bytes/1024
 ```
 
-### 3. 在服务器 B 逐级压测
+### 4. 在服务器 B 逐级压测
 
 先验证低并发，再逐级提高连接数；每一组结束后确认没有错误再继续：
 
@@ -262,7 +347,19 @@ ss -s
 资源耗尽错误时，结果才可用于比较。记录 Requests/sec、平均延迟、P99、CPU/内存、网络
 吞吐、完整命令和配置；错误率或 P99 持续上升通常表示已经接近极限。
 
-### 4. 原生 io_uring 故障排查
+### 5. direct-vs-proxy 与原生 io_uring 故障排查
+
+`bench/run_gateway_bench.sh` 的 fixed matrix 用于在相同环境下比较 direct upstream 与
+gateway，最高只测试 `1024` 个连接。它不是自动寻找网络或框架极限的工具；极限测试应在
+每组无错误后，以本节的 `wrk` 命令逐级增加连接数，并记录 P99、错误率、FD、CPU、队列和
+网络指标。
+
+当前仓库的 `gateway_mock_upstream` 固定绑定 `127.0.0.1`，因此服务器 B 不能将
+`--direct http://127.0.0.1:9001` 用作 direct baseline。两服务器拓扑中可从 B 压测 gateway
+路径；若需要 strict direct-vs-proxy 对照，必须使用服务器 B 可通过内网访问的 upstream。
+它可以是服务器 A 私网地址上的真实测试服务，也可以在服务器 C 上；安全组仅向服务器 B
+放行对应端口。当前 bundled mock upstream 不具备指定绑定地址的选项，因此不能直接用于该
+跨机 direct baseline，也不应为了运行该对照向公网开放它。
 
 ```bash
 # 0 表示内核没有全局禁用 io_uring
@@ -271,6 +368,7 @@ ulimit -n
 ulimit -l
 pgrep -a ucp_gateway
 ss -ltn '( sport = :8080 or sport = :9001 or sport = :9002 )'
+cat /proc/net/sockstat
 ```
 
 若出现 `Operation not permitted`，先确认云主机内核和安全策略允许 io_uring；若出现连接
@@ -281,7 +379,9 @@ ss -ltn '( sport = :8080 or sport = :9001 or sport = :9002 )'
 
 固定矩阵会对 1 KiB、4 KiB、16 KiB 响应分别执行 direct 和 proxy 的 warm-up，
 随后在 64、256、1024 连接下运行 30 秒。脚本保存原始 stdout/stderr，并在 wrk
-报告 socket 或 HTTP 错误时返回非零状态。
+报告 socket 或 HTTP 错误时返回非零状态。下列 `127.0.0.1` 命令仅适用于网关和 upstream
+均运行在同一主机的本地对照；两服务器部署请使用前述服务器 A 的私网 IP，并遵守 direct
+upstream 对服务器 B 的可达性要求。
 
 ```bash
 bench/run_gateway_bench.sh \
